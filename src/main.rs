@@ -1,13 +1,20 @@
 use std::{
     env, fs,
-    io::{self, Write},
+    io::{self, Write}
 };
 
 use num_enum::{FromPrimitive, IntoPrimitive, TryFromPrimitive};
 
 const STACK_SIZE: usize = 256;
 
-type Value = f64;
+type Number = f64;
+
+#[derive(Clone, Copy, Debug)]
+enum Value {
+    Bool(bool),
+    Nil,
+    Number(Number),
+}
 
 fn is_digit(c: char) -> bool {
     return c >= '0' && c <= '9';
@@ -17,12 +24,82 @@ fn is_alpha(c: char) -> bool {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
 }
 
+fn make_number(n: Number) -> Value {
+    return Value::Number(n);
+}
+
+fn make_bool(b: bool) -> Value {
+    return Value::Bool(b);
+}
+
+fn make_nil() -> Value {
+    return Value::Nil;
+}
+
+fn as_number(value: Value) -> Number {
+    match value {
+        Value::Number(n) => n,
+        _ => 0.0
+    }
+}
+
+fn as_bool(value: Value) -> bool {
+    match value {
+        Value::Bool(b) => b,
+        _ => false,
+    }
+}
+
+fn is_number(value: &Value) -> bool {
+    match value {
+        Value::Number(_) => true,
+        _ => false,
+    }
+}
+
+fn is_bool(value: &Value) -> bool {
+    match value {
+        Value::Bool(_) => true,
+        _ => false,
+    }
+}
+
+fn is_nil(value: &Value) -> bool {
+    match value {
+        Value::Nil => true,
+        _ => false,
+    }
+}
+
+fn is_falsey(value: Value) -> bool {
+    return is_nil(&value) || (is_bool(&value) && !as_bool(value))
+}
+
+fn are_equal(v1: Value, v2: Value) -> bool {
+    if std::mem::discriminant(&v1) != std::mem::discriminant(&v2) {
+        return false;
+    }
+
+    return match v1 {
+        Value::Bool(_) => as_bool(v1) == as_bool(v2),
+        Value::Number(_) => as_number(v1) == as_number(v2),
+        Value::Nil => true,
+        _ => false,
+    }
+}
+
 #[macro_export]
 macro_rules! binary_op {
-    ($self: expr, $op: tt) => {{
-        let right = $self.pop_stack();
-        let left = $self.pop_stack();
-        $self.push_stack(left $op right);
+    ($self: expr, $op: tt, $transform: tt) => {{
+        if !is_number($self.peek(0)) || !is_number($self.peek(1)) {
+            $self.runtime_error("Operands for binary operation must be numbers.");
+            return InterpretResult::InterpretRuntimeError;
+        }
+
+        let right = as_number($self.pop_stack());
+        let left = as_number($self.pop_stack());
+
+        $self.push_stack($transform(left $op right));
     }};
 }
 
@@ -30,10 +107,17 @@ macro_rules! binary_op {
 #[repr(u8)]
 enum OpCode {
     OpConstant,
+    OpNil,
+    OpTrue,
+    OpFalse,
+    OpEqual,
+    OpGreater,
+    OpLess,
     OpAdd,
     OpSubtract,
     OpMultiply,
     OpDivide,
+    OpNot,
     OpNegate,
     OpReturn,
 }
@@ -127,12 +211,39 @@ impl VM {
         return self.stack.pop().unwrap();
     }
 
+    fn peek(&self, offset: usize) -> &Value {
+        let index: usize = self.stack_top - 1 - offset;
+        return self.stack.get(index).unwrap();
+    }
+
+    fn consume_number(&mut self) -> Option<Value> {
+        match self.peek(0) {
+            Value::Number(_) => {
+                return Some(self.pop_stack());
+            }
+            _ => {
+                self.runtime_error("Operand must be a number.");
+                return None;
+            }
+        }
+    }
+
+    fn runtime_error(&mut self, message: &str) {
+        eprintln!("{message}");
+
+        let index: usize = self.ip - self.chunk.code.len() - 1;
+        let line: &usize = self.chunk.lines.get(index).unwrap();
+        eprintln!("[line {line}] in script");
+
+        self.reset_stack();
+    }
+
     fn run(&mut self) -> InterpretResult {
         loop {
             if env::var("DEBUG").is_ok() {
                 print!("          ");
                 for i in 0..self.stack_top {
-                    print!("[{}]", *self.stack.get(i).unwrap())
+                    print!("[{:?}]", *self.stack.get(i).unwrap())
                 }
                 println!();
 
@@ -143,29 +254,40 @@ impl VM {
             match OpCode::try_from(instruction).unwrap() {
                 OpCode::OpReturn => {
                     let value = self.pop_stack();
-                    println!("{value}");
+                    println!("{:?}", value);
                     return InterpretResult::InterpretOk;
                 }
-                OpCode::OpAdd => {
-                    binary_op!(self, +)
-                }
-                OpCode::OpSubtract => {
-                    binary_op!(self, -)
-                }
-                OpCode::OpMultiply => {
-                    binary_op!(self, *)
-                }
-                OpCode::OpDivide => {
-                    binary_op!(self, /)
-                }
                 OpCode::OpNegate => {
-                    let value = self.pop_stack();
-                    self.push_stack(-value);
+                    match self.consume_number() {
+                        Some(Value::Number(n)) => self.push_stack(Value::Number(-n)),
+                        _ => {
+                            return InterpretResult::InterpretRuntimeError;
+                        }
+                    }
                 }
                 OpCode::OpConstant => {
                     let constant = self.read_constant();
                     self.push_stack(constant);
                 }
+                OpCode::OpNot => {
+                    let result: Value = make_bool(is_falsey(self.pop_stack()));
+                    self.push_stack(result);
+                }
+                OpCode::OpEqual => {
+                    let b = self.pop_stack();
+                    let a = self.pop_stack();
+                    
+                    self.push_stack(make_bool(are_equal(a, b)));
+                }
+                OpCode::OpGreater =>  binary_op!(self, >, make_bool),
+                OpCode::OpLess =>  binary_op!(self, <, make_bool),
+                OpCode::OpAdd => binary_op!(self, +, make_number),
+                OpCode::OpSubtract => binary_op!(self, -, make_number),
+                OpCode::OpMultiply => binary_op!(self, *, make_number),
+                OpCode::OpDivide => binary_op!(self, /, make_number),
+                OpCode::OpNil => self.push_stack(make_nil()),
+                OpCode::OpTrue => self.push_stack(make_bool(true)),
+                OpCode::OpFalse => self.push_stack(make_bool(false)),
             };
         }
     }
@@ -396,7 +518,7 @@ impl<'scanner> Scanner<'scanner> {
             token_type: TokenType,
         ) -> TokenType {
             if scanner.current - scanner.start == start + length
-                && &scanner.source[scanner.start + start..scanner.start + length] == rest
+                && &scanner.source[scanner.start + start..scanner.start + start + length] == rest
             {
                 return token_type;
             }
@@ -625,31 +747,31 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
                 ParseRule::new(None, None, Precedence::None), // TokenType::Semicolon
                 ParseRule::new(None, Some(Compiler::binary), Precedence::Factor), // TokenType::Slash
                 ParseRule::new(None, Some(Compiler::binary), Precedence::Factor), // TokenType::Star
-                ParseRule::new(None, None, Precedence::None),                     // TokenType::Bang
-                ParseRule::new(None, None, Precedence::None), // TokenType::BangEqual
+                ParseRule::new(Some(Compiler::unary), None, Precedence::None), // TokenType::Bang
+                ParseRule::new(None, Some(Compiler::binary), Precedence::Equality), // TokenType::BangEqual
                 ParseRule::new(None, None, Precedence::None), // TokenType::Equal
-                ParseRule::new(None, None, Precedence::None), // TokenType::EqualEqual
-                ParseRule::new(None, None, Precedence::None), // TokenType::Greater
-                ParseRule::new(None, None, Precedence::None), // TokenType::GreaterEqual
-                ParseRule::new(None, None, Precedence::None), // TokenType::Less
-                ParseRule::new(None, None, Precedence::None), // TokenType::LessEqual
+                ParseRule::new(None, Some(Compiler::binary), Precedence::Equality), // TokenType::EqualEqual
+                ParseRule::new(None, Some(Compiler::binary), Precedence::Comparison), // TokenType::Greater
+                ParseRule::new(None, Some(Compiler::binary), Precedence::Comparison), // TokenType::GreaterEqual
+                ParseRule::new(None, Some(Compiler::binary), Precedence::Comparison), // TokenType::Less
+                ParseRule::new(None, Some(Compiler::binary), Precedence::Comparison), // TokenType::LessEqual
                 ParseRule::new(None, None, Precedence::None), // TokenType::Identifier
                 ParseRule::new(None, None, Precedence::None), // TokenType::String
                 ParseRule::new(Some(Compiler::number), None, Precedence::None), // TokenType::Number
                 ParseRule::new(None, None, Precedence::None), // TokenType::And
                 ParseRule::new(None, None, Precedence::None), // TokenType::Class
                 ParseRule::new(None, None, Precedence::None), // TokenType::Else
-                ParseRule::new(None, None, Precedence::None), // TokenType::False
+                ParseRule::new(Some(Compiler::literal), None, Precedence::None), // TokenType::False
                 ParseRule::new(None, None, Precedence::None), // TokenType::For
                 ParseRule::new(None, None, Precedence::None), // TokenType::Fun
                 ParseRule::new(None, None, Precedence::None), // TokenType::If
-                ParseRule::new(None, None, Precedence::None), // TokenType::Nil
+                ParseRule::new(Some(Compiler::literal), None, Precedence::None), // TokenType::Nil
                 ParseRule::new(None, None, Precedence::None), // TokenType::Or
                 ParseRule::new(None, None, Precedence::None), // TokenType::Print
                 ParseRule::new(None, None, Precedence::None), // TokenType::Return
                 ParseRule::new(None, None, Precedence::None), // TokenType::Super
                 ParseRule::new(None, None, Precedence::None), // TokenType::This
-                ParseRule::new(None, None, Precedence::None), // TokenType::True
+                ParseRule::new(Some(Compiler::literal), None, Precedence::None), // TokenType::True
                 ParseRule::new(None, None, Precedence::None), // TokenType::Var
                 ParseRule::new(None, None, Precedence::None), // TokenType::While
                 ParseRule::new(None, None, Precedence::None), // TokenType::Error
@@ -764,16 +886,16 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
     }
 
     fn number(&mut self) {
-        let value: Value = self
+        let number: Number = self
             .parser
             .previous
             .as_ref()
             .unwrap()
             .lexeme
-            .parse::<Value>()
+            .parse::<Number>()
             .unwrap();
 
-        self.emit_constant(value);
+        self.emit_constant(Value::Number(number));
     }
 
     fn grouping(&mut self) {
@@ -787,6 +909,7 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
         self.parse_precedence(Precedence::Unary);
 
         match operator_type {
+            TokenType::Bang => self.emit_byte(OpCode::OpNot.into()),
             TokenType::Minus => self.emit_byte(OpCode::OpNegate.into()),
             _ => {}
         }
@@ -804,11 +927,28 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
         self.parse_precedence(higher_precedence);
 
         match operator_type {
+            TokenType::BangEqual => self.emit_bytes(OpCode::OpEqual.into(), OpCode::OpNot.into()),
+            TokenType::EqualEqual => self.emit_byte(OpCode::OpEqual.into()),
+            TokenType::Greater => self.emit_byte(OpCode::OpGreater.into()),
+            TokenType::GreaterEqual => self.emit_bytes(OpCode::OpLess.into(), OpCode::OpNot.into()),
+            TokenType::Less => self.emit_byte(OpCode::OpLess.into()),
+            TokenType::LessEqual => self.emit_bytes(OpCode::OpGreater.into(), OpCode::OpNot.into()),
             TokenType::Plus => self.emit_byte(OpCode::OpAdd.into()),
             TokenType::Minus => self.emit_byte(OpCode::OpSubtract.into()),
             TokenType::Star => self.emit_byte(OpCode::OpMultiply.into()),
             TokenType::Slash => self.emit_byte(OpCode::OpDivide.into()),
             _ => {}
+        }
+    }
+
+    fn literal(&mut self) {
+        match self.parser.previous.as_ref().unwrap().r#type {
+            TokenType::False => self.emit_byte(OpCode::OpFalse.into()),
+            TokenType::Nil => self.emit_byte(OpCode::OpNil.into()),
+            TokenType::True => self.emit_byte(OpCode::OpTrue.into()),
+            _ => {
+                self.parser.error_at_previous("Could not identify token type of literal.");
+            }
         }
     }
 }
@@ -831,7 +971,7 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
     fn constant_instruction(name: &str, chunk: &Chunk, offset: usize) -> usize {
         let constant_offset = *chunk.code.get(offset + 1).unwrap() as usize;
         println!(
-            "{:<16} {:>4} '{}'",
+            "{:<16} {:>4} '{:?}'",
             name,
             constant_offset,
             chunk.constants.get(constant_offset).unwrap()
@@ -855,6 +995,13 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         OpCode::OpDivide => simple_instruction("OP_DIVIDE", offset),
         OpCode::OpNegate => simple_instruction("OP_NEGATE", offset),
         OpCode::OpConstant => constant_instruction("OP_CONSTANT", chunk, offset),
+        OpCode::OpNil => simple_instruction("OP_NIL", offset),
+        OpCode::OpTrue => simple_instruction("OP_TRUE", offset),
+        OpCode::OpFalse => simple_instruction("OP_FALSE", offset),
+        OpCode::OpNot => simple_instruction("OP_NOT", offset),
+        OpCode::OpEqual => simple_instruction("OP_EQUAL", offset),
+        OpCode::OpGreater => simple_instruction("OP_GREATER", offset),
+        OpCode::OpLess => simple_instruction("OP_LESS", offset),
     };
 }
 
