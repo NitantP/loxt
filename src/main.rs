@@ -1,4 +1,6 @@
+use core::fmt;
 use std::{
+    collections::{HashMap},
     env, fs,
     io::{self, Write}
 };
@@ -9,11 +11,45 @@ const STACK_SIZE: usize = 256;
 
 type Number = f64;
 
+struct Interner {
+    map: HashMap<String, u32>,
+    vec: Vec<String>,
+}
+
+impl Interner {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            vec: Vec::new(),
+        }
+    }
+
+    fn intern(&mut self, key: &str) -> u32 {
+        if let Some(&idx) = self.map.get(key) {
+            return idx;
+        }
+
+        let idx = self.vec.len() as u32;
+        self.map.insert(key.to_owned(), idx);
+        self.vec.push(key.to_owned());
+
+        debug_assert!(self.lookup(idx) == key);
+        debug_assert!(self.intern(key) == idx);
+
+        return idx;
+    }
+
+    fn lookup(&self, idx: u32) -> &str {
+        return self.vec[idx as usize].as_str();
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Value {
     Bool(bool),
     Nil,
     Number(Number),
+    String(u32),
 }
 
 fn is_digit(c: char) -> bool {
@@ -36,17 +72,24 @@ fn make_nil() -> Value {
     return Value::Nil;
 }
 
-fn as_number(value: Value) -> Number {
+fn as_number(value: &Value) -> Number {
     match value {
-        Value::Number(n) => n,
-        _ => 0.0
+        Value::Number(n) => *n,
+        _ => Number::MAX,
     }
 }
 
-fn as_bool(value: Value) -> bool {
+fn as_bool(value: &Value) -> bool {
     match value {
-        Value::Bool(b) => b,
+        Value::Bool(b) => *b,
         _ => false,
+    }
+}
+
+fn as_string_idx(value: &Value) -> u32 {
+    match value {
+        Value::String(idx) => *idx,
+        _ => u32::MAX,
     }
 }
 
@@ -71,19 +114,23 @@ fn is_nil(value: &Value) -> bool {
     }
 }
 
-fn is_falsey(value: Value) -> bool {
-    return is_nil(&value) || (is_bool(&value) && !as_bool(value))
+fn is_string(value: &Value) -> bool {
+    match value {
+        Value::String(_) => true,
+        _ => false,
+    }
 }
 
-fn are_equal(v1: Value, v2: Value) -> bool {
-    if std::mem::discriminant(&v1) != std::mem::discriminant(&v2) {
-        return false;
-    }
+fn is_falsey(value: Value) -> bool {
+    return is_nil(&value) || (is_bool(&value) && !as_bool(&value))
+}
 
-    return match v1 {
-        Value::Bool(_) => as_bool(v1) == as_bool(v2),
-        Value::Number(_) => as_number(v1) == as_number(v2),
-        Value::Nil => true,
+fn are_equal(v1: &Value, v2: &Value) -> bool {
+    match (v1, v2) {
+        (Value::Bool(b1), Value::Bool(b2)) => b1 == b2,
+        (Value::Number(n1), Value::Number(n2)) => n1 == n2,
+        (Value::String(i1), Value::String(i2)) => i1 == i2,
+        (Value::Nil, Value::Nil) => true,
         _ => false,
     }
 }
@@ -92,12 +139,12 @@ fn are_equal(v1: Value, v2: Value) -> bool {
 macro_rules! binary_op {
     ($self: expr, $op: tt, $transform: tt) => {{
         if !is_number($self.peek(0)) || !is_number($self.peek(1)) {
-            $self.runtime_error("Operands for binary operation must be numbers.");
+            $self.runtime_error("Expected numeric operands for binary operator.");
             return InterpretResult::InterpretRuntimeError;
         }
 
-        let right = as_number($self.pop_stack());
-        let left = as_number($self.pop_stack());
+        let right = as_number(&$self.pop_stack());
+        let left = as_number(&$self.pop_stack());
 
         $self.push_stack($transform(left $op right));
     }};
@@ -176,14 +223,15 @@ impl VM {
 
     fn interpret(source: &str) -> InterpretResult {
         let mut chunk: Chunk = Chunk::new();
+        let mut strings: Interner = Interner::new();
 
-        if !Compiler::compile(source, &mut chunk) {
+        if !Compiler::compile(source, &mut chunk, &mut strings) {
             return InterpretResult::InterpretCompilerError;
         }
 
         let mut vm: VM = VM::new(chunk);
 
-        return vm.run();
+        return vm.run(&mut strings);
     }
 
     fn read_byte(&mut self) -> u8 {
@@ -238,7 +286,7 @@ impl VM {
         self.reset_stack();
     }
 
-    fn run(&mut self) -> InterpretResult {
+    fn run(&mut self, strings: &mut Interner) -> InterpretResult {
         loop {
             if env::var("DEBUG").is_ok() {
                 print!("          ");
@@ -254,7 +302,13 @@ impl VM {
             match OpCode::try_from(instruction).unwrap() {
                 OpCode::OpReturn => {
                     let value = self.pop_stack();
-                    println!("{:?}", value);
+                    match value {
+                        Value::String(idx) => println!("{}", strings.lookup(idx)),
+                        Value::Number(n) => println!("{}", n),
+                        Value::Bool(b) => println!("{}", b),
+                        Value::Nil => println!("nil"),
+                    }
+
                     return InterpretResult::InterpretOk;
                 }
                 OpCode::OpNegate => {
@@ -277,11 +331,22 @@ impl VM {
                     let b = self.pop_stack();
                     let a = self.pop_stack();
                     
-                    self.push_stack(make_bool(are_equal(a, b)));
+                    self.push_stack(make_bool(are_equal(&a, &b)));
                 }
                 OpCode::OpGreater =>  binary_op!(self, >, make_bool),
                 OpCode::OpLess =>  binary_op!(self, <, make_bool),
-                OpCode::OpAdd => binary_op!(self, +, make_number),
+                OpCode::OpAdd => {
+                    if is_string(self.peek(0)) && is_string(self.peek(1)) {
+                        let b = strings.lookup(as_string_idx(&self.pop_stack()));
+                        let a = strings.lookup(as_string_idx(&self.pop_stack()));
+
+                        let concatenated = format!("{}{}", a, b);
+                        let idx = strings.intern(&concatenated);
+                        self.push_stack(Value::String(idx));
+                    } else{
+                        binary_op!(self, +, make_number);
+                    }
+                },
                 OpCode::OpSubtract => binary_op!(self, -, make_number),
                 OpCode::OpMultiply => binary_op!(self, *, make_number),
                 OpCode::OpDivide => binary_op!(self, /, make_number),
@@ -723,10 +788,11 @@ struct Compiler<'chunk, 'compiler> {
     scanner: Scanner<'compiler>,
     parser: Parser<'compiler>,
     rules: [ParseRule<'chunk, 'compiler>; 40],
+    strings: &'compiler mut Interner,
 }
 
 impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
-    fn new(source: &'compiler str, chunk: &'chunk mut Chunk) -> Self {
+    fn new(source: &'compiler str, chunk: &'chunk mut Chunk, strings: &'compiler mut Interner) -> Self {
         Self {
             chunk,
             scanner: Scanner::new(source),
@@ -756,7 +822,7 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
                 ParseRule::new(None, Some(Compiler::binary), Precedence::Comparison), // TokenType::Less
                 ParseRule::new(None, Some(Compiler::binary), Precedence::Comparison), // TokenType::LessEqual
                 ParseRule::new(None, None, Precedence::None), // TokenType::Identifier
-                ParseRule::new(None, None, Precedence::None), // TokenType::String
+                ParseRule::new(Some(Compiler::string), None, Precedence::None), // TokenType::String
                 ParseRule::new(Some(Compiler::number), None, Precedence::None), // TokenType::Number
                 ParseRule::new(None, None, Precedence::None), // TokenType::And
                 ParseRule::new(None, None, Precedence::None), // TokenType::Class
@@ -777,11 +843,12 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
                 ParseRule::new(None, None, Precedence::None), // TokenType::Error
                 ParseRule::new(None, None, Precedence::None), // TokenType::EOF
             ],
+            strings,
         }
     }
 
-    fn compile(source: &str, chunk: &mut Chunk) -> bool {
-        let mut compiler: Compiler = Compiler::new(source, chunk);
+    fn compile(source: &str, chunk: &mut Chunk, strings: &mut Interner) -> bool {
+        let mut compiler: Compiler = Compiler::new(source, chunk, strings);
 
         compiler.advance();
         compiler.expression();
@@ -950,6 +1017,12 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
                 self.parser.error_at_previous("Could not identify token type of literal.");
             }
         }
+    }
+
+    fn string(&mut self) {
+        let lexeme = self.parser.previous.as_ref().unwrap().lexeme;
+        let idx: u32 = self.strings.intern(&lexeme[1..lexeme.len() - 1]);
+        self.emit_constant(Value::String(idx));
     }
 }
 
