@@ -86,9 +86,9 @@ fn as_bool(value: &Value) -> bool {
     }
 }
 
-fn as_string_idx(value: &Value) -> u32 {
+fn as_string_idx(value: Value) -> u32 {
     match value {
-        Value::String(idx) => *idx,
+        Value::String(idx) => idx,
         _ => u32::MAX,
     }
 }
@@ -167,6 +167,11 @@ enum OpCode {
     OpNot,
     OpNegate,
     OpReturn,
+    OpPrint,
+    OpPop,
+    OpDefineGlobal,
+    OpGetGlobal,
+    OpSetGlobal,
 }
 
 #[derive(Debug)]
@@ -209,6 +214,8 @@ struct VM {
     ip: usize,
     stack: Vec<Value>,
     stack_top: usize,
+    strings: Interner,
+    globals: HashMap<u32, Value>,
 }
 
 impl VM {
@@ -218,20 +225,21 @@ impl VM {
             ip: 0,
             stack: Vec::with_capacity(STACK_SIZE),
             stack_top: 0,
+            strings: Interner::new(),
+            globals: HashMap::new(),
         }
     }
 
-    fn interpret(source: &str) -> InterpretResult {
+    fn interpret(&mut self, source: &str) -> InterpretResult {
         let mut chunk: Chunk = Chunk::new();
-        let mut strings: Interner = Interner::new();
 
-        if !Compiler::compile(source, &mut chunk, &mut strings) {
+        if !Compiler::compile(source, &mut chunk, &mut self.strings) {
             return InterpretResult::InterpretCompilerError;
         }
 
-        let mut vm: VM = VM::new(chunk);
-
-        return vm.run(&mut strings);
+        self.chunk = chunk;
+        self.ip = 0;
+        return self.run();
     }
 
     fn read_byte(&mut self) -> u8 {
@@ -286,7 +294,7 @@ impl VM {
         self.reset_stack();
     }
 
-    fn run(&mut self, strings: &mut Interner) -> InterpretResult {
+    fn run(&mut self) -> InterpretResult {
         loop {
             if env::var("DEBUG").is_ok() {
                 print!("          ");
@@ -301,14 +309,6 @@ impl VM {
             let instruction = self.read_byte();
             match OpCode::try_from(instruction).unwrap() {
                 OpCode::OpReturn => {
-                    let value = self.pop_stack();
-                    match value {
-                        Value::String(idx) => println!("{}", strings.lookup(idx)),
-                        Value::Number(n) => println!("{}", n),
-                        Value::Bool(b) => println!("{}", b),
-                        Value::Nil => println!("nil"),
-                    }
-
                     return InterpretResult::InterpretOk;
                 }
                 OpCode::OpNegate => {
@@ -337,22 +337,58 @@ impl VM {
                 OpCode::OpLess =>  binary_op!(self, <, make_bool),
                 OpCode::OpAdd => {
                     if is_string(self.peek(0)) && is_string(self.peek(1)) {
-                        let b = strings.lookup(as_string_idx(&self.pop_stack()));
-                        let a = strings.lookup(as_string_idx(&self.pop_stack()));
+                        let b = as_string_idx(self.pop_stack());
+                        let a = as_string_idx(self.pop_stack());
+
+                        let b = self.strings.lookup(b);
+                        let a = self.strings.lookup(a);
 
                         let concatenated = format!("{}{}", a, b);
-                        let idx = strings.intern(&concatenated);
+                        let idx = self.strings.intern(&concatenated);
                         self.push_stack(Value::String(idx));
                     } else{
                         binary_op!(self, +, make_number);
                     }
                 },
+                OpCode::OpPrint => {
+                    match self.pop_stack() {
+                        Value::String(idx) => println!("{}", self.strings.lookup(idx)),
+                        Value::Number(n) => println!("{}", n),
+                        Value::Bool(b) => println!("{}", b),
+                        Value::Nil => println!("nil"),
+                    }
+                }
+                OpCode::OpDefineGlobal => {
+                    let string_idx = as_string_idx(self.read_constant());
+                    self.globals.insert(string_idx, self.peek(0).to_owned());
+                    self.pop_stack();
+                }
+                OpCode::OpGetGlobal => {
+                    let string_idx = as_string_idx(self.read_constant());
+                    match self.globals.get(&string_idx) {
+                        Some(&value) => self.push_stack(value),
+                        None => {
+                            self.runtime_error(&format!("Undefined variable '{}'.", self.strings.lookup(string_idx)));
+                            return InterpretResult::InterpretRuntimeError;
+                        }
+                    }
+                }
+                OpCode::OpSetGlobal => {
+                    let string_idx = as_string_idx(self.read_constant());
+                    if self.globals.contains_key(&string_idx) {
+                        self.globals.insert(string_idx, self.peek(0).to_owned());
+                    } else {
+                        self.runtime_error(&format!("Undefined variable '{}'.", self.strings.lookup(string_idx)));
+                        return InterpretResult::InterpretRuntimeError;
+                    }
+                }
                 OpCode::OpSubtract => binary_op!(self, -, make_number),
                 OpCode::OpMultiply => binary_op!(self, *, make_number),
                 OpCode::OpDivide => binary_op!(self, /, make_number),
                 OpCode::OpNil => self.push_stack(make_nil()),
                 OpCode::OpTrue => self.push_stack(make_bool(true)),
                 OpCode::OpFalse => self.push_stack(make_bool(false)),
+                OpCode::OpPop => { self.pop_stack(); }
             };
         }
     }
@@ -762,7 +798,7 @@ enum Precedence {
     Primary,
 }
 
-type ParseFn<'chunk, 'compiler> = fn(&mut Compiler<'chunk, 'compiler>);
+type ParseFn<'chunk, 'compiler> = fn(&mut Compiler<'chunk, 'compiler>, bool);
 struct ParseRule<'chunk, 'compiler> {
     prefix: Option<ParseFn<'chunk, 'compiler>>,
     infix: Option<ParseFn<'chunk, 'compiler>>,
@@ -821,7 +857,7 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
                 ParseRule::new(None, Some(Compiler::binary), Precedence::Comparison), // TokenType::GreaterEqual
                 ParseRule::new(None, Some(Compiler::binary), Precedence::Comparison), // TokenType::Less
                 ParseRule::new(None, Some(Compiler::binary), Precedence::Comparison), // TokenType::LessEqual
-                ParseRule::new(None, None, Precedence::None), // TokenType::Identifier
+                ParseRule::new(Some(Compiler::variable), None, Precedence::None), // TokenType::Identifier
                 ParseRule::new(Some(Compiler::string), None, Precedence::None), // TokenType::String
                 ParseRule::new(Some(Compiler::number), None, Precedence::None), // TokenType::Number
                 ParseRule::new(None, None, Precedence::None), // TokenType::And
@@ -851,10 +887,11 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
         let mut compiler: Compiler = Compiler::new(source, chunk, strings);
 
         compiler.advance();
-        compiler.expression();
-        compiler.consume(TokenType::EOF, "Expect end of expression.");
-
-        compiler.end_compilation();
+        
+        while !compiler.matches(TokenType::EOF) {
+            compiler.declaration();
+            compiler.end_compilation();
+        }
 
         return !compiler.parser.had_error;
     }
@@ -917,6 +954,19 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
         self.parser.error_at_current(message);
     }
 
+    fn check(&mut self, r#type: TokenType) -> bool {
+        return self.parser.current.as_ref().unwrap().r#type == r#type;
+    }
+
+    fn matches(&mut self, r#type: TokenType) -> bool {
+        if !self.check(r#type) {
+            return false;
+        }
+
+        self.advance();
+        return true;
+    }
+
     fn get_rule(&self, operator_type: TokenType) -> &ParseRule<'chunk, 'compiler> {
         return self.rules.get(operator_type as usize).unwrap();
     }
@@ -924,13 +974,15 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
     fn parse_precedence(&mut self, precedence: Precedence) {
         self.advance();
 
+        let can_assign: bool = precedence <= Precedence::Assignment;
         match self
             .get_rule(self.parser.previous.as_ref().unwrap().r#type)
             .prefix
         {
-            Some(prefix_rule) => prefix_rule(self),
+            Some(prefix_rule) => prefix_rule(self, can_assign),
             None => self.parser.error_at_previous("Expect expression."),
         }
+
 
         while precedence
             <= self
@@ -942,17 +994,107 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
             let previous_token_rules: &ParseRule = self.get_rule(previous_token.r#type);
 
             match previous_token_rules.infix {
-                Some(infix_rule) => infix_rule(self),
+                Some(infix_rule) => infix_rule(self, can_assign),
                 None => self.parser.error_at_previous("Expect infix expression."),
             }
         }
+
+        if can_assign && self.matches(TokenType::Equal) {
+            self.parser.error_at_current("Invalid assignment target.");
+        }
+    }
+
+    fn parse_variable(&mut self, error_message: &str) -> u8 {
+        self.consume(TokenType::Identifier, error_message);
+        return self.identifier_constant();
+    }
+
+    fn define_variable(&mut self, global: u8) {
+        self.emit_bytes(OpCode::OpDefineGlobal.into(), global);
+    }
+
+    fn identifier_constant(&mut self) -> u8 {
+        let lexeme = self.parser.previous.as_ref().unwrap().lexeme;
+        let idx = self.strings.intern(lexeme);
+        return self.chunk.add_constant(Value::String(idx)).unwrap() as u8;
+    }
+
+    fn synchronize(&mut self) {
+        self.parser.is_panic_mode = false;
+
+        let mut current = self.parser.current.as_ref().unwrap().r#type;
+        while current != TokenType::EOF {
+            if self.parser.previous.as_ref().unwrap().r#type == TokenType::Semicolon {
+                return;
+            }
+
+            match current {
+                TokenType::Class | 
+                TokenType::Fun | 
+                TokenType::Var | 
+                TokenType::For | 
+                TokenType::If | 
+                TokenType::While | 
+                TokenType::Print | 
+                TokenType::Return => return,
+                _ => {}, 
+            }
+
+            self.advance();
+            current = self.parser.current.as_ref().unwrap().r#type;
+        }
+    }
+
+    fn declaration(&mut self) {
+        if self.matches(TokenType::Var) {
+            self.var_declaration();
+        } else {
+        self.statement();
+        }
+
+        if self.parser.is_panic_mode {
+            self.synchronize();
+        }
+    }
+
+    fn var_declaration(&mut self) {
+        let global = self.parse_variable("Expect variable name.");
+
+        if self.matches(TokenType::Equal) {
+            self.expression();
+        } else {
+            self.emit_byte(OpCode::OpNil.into());
+        }
+
+        self.consume(TokenType::Semicolon, "Expect ';' after variable declaration.");
+        self.define_variable(global);
+    }
+
+    fn statement(&mut self) {
+        if self.matches(TokenType::Print) {
+            self.print_statement();
+        } else {
+            self.expression_statement();
+        }
+    }
+
+    fn print_statement(&mut self) {
+        self.expression();
+        self.consume(TokenType::Semicolon, "Expect ';' after value.");
+        self.emit_byte(OpCode::OpPrint.into());
+    }
+
+    fn expression_statement(&mut self) {
+        self.expression();
+        self.consume(TokenType::Semicolon, "Expect ';' after expression.");
+        self.emit_byte(OpCode::OpPop.into());
     }
 
     fn expression(&mut self) {
         self.parse_precedence(Precedence::Assignment);
     }
 
-    fn number(&mut self) {
+    fn number(&mut self, can_assign: bool) {
         let number: Number = self
             .parser
             .previous
@@ -965,12 +1107,12 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
         self.emit_constant(Value::Number(number));
     }
 
-    fn grouping(&mut self) {
+    fn grouping(&mut self, can_assign: bool) {
         self.expression();
         self.consume(TokenType::RightParen, "Expect ')' after expression.");
     }
 
-    fn unary(&mut self) {
+    fn unary(&mut self, can_assign: bool) {
         let operator_type: TokenType = self.parser.previous.as_ref().unwrap().r#type;
 
         self.parse_precedence(Precedence::Unary);
@@ -982,7 +1124,7 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
         }
     }
 
-    fn binary(&mut self) {
+    fn binary(&mut self, can_assign: bool) {
         let operator_type: TokenType = self.parser.previous.as_ref().unwrap().r#type;
         let rule: &ParseRule = self.get_rule(operator_type);
 
@@ -1008,7 +1150,7 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
         }
     }
 
-    fn literal(&mut self) {
+    fn literal(&mut self, can_assign: bool) {
         match self.parser.previous.as_ref().unwrap().r#type {
             TokenType::False => self.emit_byte(OpCode::OpFalse.into()),
             TokenType::Nil => self.emit_byte(OpCode::OpNil.into()),
@@ -1019,10 +1161,25 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
         }
     }
 
-    fn string(&mut self) {
+    fn string(&mut self, can_assign: bool) {
         let lexeme = self.parser.previous.as_ref().unwrap().lexeme;
         let idx: u32 = self.strings.intern(&lexeme[1..lexeme.len() - 1]);
         self.emit_constant(Value::String(idx));
+    }
+
+    fn variable(&mut self, can_assign: bool) {
+        self.named_variable(can_assign);
+    }
+
+    fn named_variable(&mut self, can_assign: bool) {
+        let arg = self.identifier_constant();
+
+        if can_assign && self.matches(TokenType::Equal) {
+            self.expression();
+            self.emit_bytes(OpCode::OpSetGlobal.into(), arg);
+        } else {
+            self.emit_bytes(OpCode::OpGetGlobal.into(), arg);
+        }
     }
 }
 
@@ -1075,11 +1232,17 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         OpCode::OpEqual => simple_instruction("OP_EQUAL", offset),
         OpCode::OpGreater => simple_instruction("OP_GREATER", offset),
         OpCode::OpLess => simple_instruction("OP_LESS", offset),
+        OpCode::OpPrint => simple_instruction("OP_PRINT", offset),
+        OpCode::OpPop => simple_instruction("OP_POP", offset),
+        OpCode::OpDefineGlobal => constant_instruction("OP_DEFINE_GLOBAL", chunk, offset),
+        OpCode::OpGetGlobal => constant_instruction("OP_GET_GLOBAL", chunk, offset),
+        OpCode::OpSetGlobal => constant_instruction("OP_SET_GLOBAL", chunk, offset),
     };
 }
 
 fn repl() {
     let mut buffer = String::new();
+    let mut vm: VM = VM::new(Chunk::new());
     loop {
         print!("> ");
         io::stdout().flush().unwrap();
@@ -1088,7 +1251,7 @@ fn repl() {
         if buffer.len() == 0 {
             break;
         } else {
-            VM::interpret(&buffer);
+            vm.interpret(&buffer);
             buffer.clear();
         }
     }
