@@ -172,6 +172,8 @@ enum OpCode {
     OpDefineGlobal,
     OpGetGlobal,
     OpSetGlobal,
+    OpGetLocal,
+    OpSetLocal,
 }
 
 #[derive(Debug)]
@@ -269,7 +271,7 @@ impl VM {
 
     fn peek(&self, offset: usize) -> &Value {
         let index: usize = self.stack_top - 1 - offset;
-        return self.stack.get(index).unwrap();
+        return &self.stack[index];
     }
 
     fn consume_number(&mut self) -> Option<Value> {
@@ -381,6 +383,14 @@ impl VM {
                         self.runtime_error(&format!("Undefined variable '{}'.", self.strings.lookup(string_idx)));
                         return InterpretResult::InterpretRuntimeError;
                     }
+                }
+                OpCode::OpGetLocal => {
+                    let idx = self.read_byte() as usize;
+                    self.push_stack(self.stack[idx]);
+                }
+                OpCode::OpSetLocal => {
+                    let idx = self.read_byte() as usize;
+                    self.stack[idx] = *self.peek(0);
                 }
                 OpCode::OpSubtract => binary_op!(self, -, make_number),
                 OpCode::OpMultiply => binary_op!(self, *, make_number),
@@ -819,12 +829,28 @@ impl<'chunk, 'compiler> ParseRule<'chunk, 'compiler> {
     }
 }
 
+struct Local<'compiler> {
+    name: &'compiler str,
+    depth: i8,
+}
+
+impl<'compiler> Local<'compiler> {
+    fn new(name: &'compiler str, depth: i8) -> Self {
+        Self {
+            name,
+            depth,
+        }
+    }
+}
+
 struct Compiler<'chunk, 'compiler> {
     chunk: &'chunk mut Chunk,
     scanner: Scanner<'compiler>,
     parser: Parser<'compiler>,
     rules: [ParseRule<'chunk, 'compiler>; 40],
     strings: &'compiler mut Interner,
+    locals: Vec<Local<'compiler>>,
+    depth: i8,
 }
 
 impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
@@ -833,6 +859,9 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
             chunk,
             scanner: Scanner::new(source),
             parser: Parser::new(),
+            strings,
+            locals: Vec::new(),
+            depth: 0,
             rules: [
                 ParseRule::new(Some(Compiler::grouping), None, Precedence::None),
                 ParseRule::new(None, None, Precedence::None), // TokenType::LeftParen
@@ -879,7 +908,6 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
                 ParseRule::new(None, None, Precedence::None), // TokenType::Error
                 ParseRule::new(None, None, Precedence::None), // TokenType::EOF
             ],
-            strings,
         }
     }
 
@@ -1006,17 +1034,61 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
 
     fn parse_variable(&mut self, error_message: &str) -> u8 {
         self.consume(TokenType::Identifier, error_message);
+
+        self.declare_variable();
+        if self.depth > 0 {
+            return 0;
+        }
+
         return self.identifier_constant();
     }
 
+    fn declare_variable(&mut self) {
+        if self.depth == 0 {
+            return;
+        }
+
+        let name = self.parser.previous.as_ref().unwrap().lexeme;
+
+        for local in self.locals.iter().rev() {
+            if local.depth != -1 && local.depth < self.depth {
+                break;
+            }
+
+            if name == local.name {
+                self.parser.error_at_previous("Already a variable with this name in this scope.");
+            }
+        }
+
+        self.add_local(name);
+    }
+
     fn define_variable(&mut self, global: u8) {
+        if self.depth > 0 {
+            self.mark_initialized();
+            return;
+        }
+
         self.emit_bytes(OpCode::OpDefineGlobal.into(), global);
+    }
+
+    fn mark_initialized(&mut self) {
+        self.locals.last_mut().unwrap().depth = self.depth;
     }
 
     fn identifier_constant(&mut self) -> u8 {
         let lexeme = self.parser.previous.as_ref().unwrap().lexeme;
         let idx = self.strings.intern(lexeme);
         return self.chunk.add_constant(Value::String(idx)).unwrap() as u8;
+    }
+
+    fn add_local(&mut self, name: &'compiler str) {
+        if self.locals.len() == 256 {
+            self.parser.error_at_previous("Too many localy variables in function.");
+            return;
+        }
+
+        self.locals.push(Local::new(name, -1));
     }
 
     fn synchronize(&mut self) {
@@ -1042,6 +1114,24 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
 
             self.advance();
             current = self.parser.current.as_ref().unwrap().r#type;
+        }
+    }
+
+    fn begin_scope(&mut self) {
+        self.depth += 1;
+    }
+
+    fn end_scope(&mut self) {
+        self.depth -= 1;
+
+        loop {
+            match self.locals.last() {
+                Some(x) if x.depth > self.depth => {
+                    self.locals.pop();
+                    self.emit_byte(OpCode::OpPop.into())
+                }
+                _ => break,
+            }
         }
     }
 
@@ -1073,6 +1163,10 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
     fn statement(&mut self) {
         if self.matches(TokenType::Print) {
             self.print_statement();
+        } else if self.matches(TokenType::LeftBrace) {
+            self.begin_scope();
+            self.block();
+            self.end_scope();
         } else {
             self.expression_statement();
         }
@@ -1088,6 +1182,14 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
         self.expression();
         self.consume(TokenType::Semicolon, "Expect ';' after expression.");
         self.emit_byte(OpCode::OpPop.into());
+    }
+
+    fn block(&mut self) {
+        while !self.check(TokenType::RightBrace) && !self.check(TokenType::EOF) {
+            self.declaration();
+        }
+
+        self.consume(TokenType::RightBrace, "Expect '}' after block.");
     }
 
     fn expression(&mut self) {
@@ -1172,14 +1274,32 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
     }
 
     fn named_variable(&mut self, can_assign: bool) {
-        let arg = self.identifier_constant();
+        let (arg, get_op, set_op) = match self.resolve_local() {
+            -1 => (self.identifier_constant(), OpCode::OpGetGlobal, OpCode::OpSetGlobal),
+            idx => (idx as u8, OpCode::OpGetLocal, OpCode::OpSetLocal),
+        };
 
         if can_assign && self.matches(TokenType::Equal) {
             self.expression();
-            self.emit_bytes(OpCode::OpSetGlobal.into(), arg);
+            self.emit_bytes(set_op.into(), arg);
         } else {
-            self.emit_bytes(OpCode::OpGetGlobal.into(), arg);
+            self.emit_bytes(get_op.into(), arg);
         }
+    }
+
+    fn resolve_local(&mut self) -> i8 {
+        let name = self.parser.previous.as_ref().unwrap().lexeme;
+
+        for (idx, local) in self.locals.iter().rev().enumerate() {
+            if name == local.name {
+                if local.depth == -1 {
+                    self.parser.error_at_previous("Can't read local variable in its own initializer.");
+                }
+                return idx as i8;
+            }
+        }
+
+        return -1;
     }
 }
 
@@ -1206,6 +1326,12 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
             constant_offset,
             chunk.constants.get(constant_offset).unwrap()
         );
+        return offset + 2;
+    }
+
+    fn byte_instruction(name: &str, chunk: &Chunk, offset: usize) -> usize {
+        let idx = chunk.code[offset + 1];
+        println!("{:<16} {:>4}", name, idx);
         return offset + 2;
     }
 
@@ -1237,6 +1363,8 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         OpCode::OpDefineGlobal => constant_instruction("OP_DEFINE_GLOBAL", chunk, offset),
         OpCode::OpGetGlobal => constant_instruction("OP_GET_GLOBAL", chunk, offset),
         OpCode::OpSetGlobal => constant_instruction("OP_SET_GLOBAL", chunk, offset),
+        OpCode::OpGetLocal => byte_instruction("OP_GET_LOCAL", chunk, offset),
+        OpCode::OpSetLocal => byte_instruction("OP_SET_LOCAL", chunk, offset),
     };
 }
 
