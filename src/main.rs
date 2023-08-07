@@ -121,8 +121,8 @@ fn is_string(value: &Value) -> bool {
     }
 }
 
-fn is_falsey(value: Value) -> bool {
-    return is_nil(&value) || (is_bool(&value) && !as_bool(&value))
+fn is_falsey(value: &Value) -> bool {
+    return is_nil(value) || (is_bool(value) && !as_bool(value))
 }
 
 fn are_equal(v1: &Value, v2: &Value) -> bool {
@@ -174,6 +174,9 @@ enum OpCode {
     OpSetGlobal,
     OpGetLocal,
     OpSetLocal,
+    OpJump,
+    OpJumpIfFalse,
+    OpLoop,
 }
 
 #[derive(Debug)]
@@ -255,6 +258,11 @@ impl VM {
         return *self.chunk.constants.get(constant_index).unwrap();
     }
 
+    fn read_short(&mut self) -> usize {
+        self.ip += 2;
+        return ((self.chunk.code[self.ip - 2] as usize) << 8) | self.chunk.code[self.ip - 1] as usize;
+    }
+
     fn reset_stack(&mut self) {
         self.stack_top = 0;
     }
@@ -326,7 +334,7 @@ impl VM {
                     self.push_stack(constant);
                 }
                 OpCode::OpNot => {
-                    let result: Value = make_bool(is_falsey(self.pop_stack()));
+                    let result: Value = make_bool(is_falsey(&self.pop_stack()));
                     self.push_stack(result);
                 }
                 OpCode::OpEqual => {
@@ -391,6 +399,20 @@ impl VM {
                 OpCode::OpSetLocal => {
                     let idx = self.read_byte() as usize;
                     self.stack[idx] = *self.peek(0);
+                }
+                OpCode::OpJump => {
+                    let offset = self.read_short();
+                    self.ip += offset;
+                }
+                OpCode::OpJumpIfFalse => {
+                    let offset = self.read_short();
+                    if is_falsey(self.peek(0)) {
+                        self.ip += offset;
+                    }
+                }
+                OpCode::OpLoop => {
+                    let offset = self.read_short();
+                    self.ip -= offset;
                 }
                 OpCode::OpSubtract => binary_op!(self, -, make_number),
                 OpCode::OpMultiply => binary_op!(self, *, make_number),
@@ -889,7 +911,7 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
                 ParseRule::new(Some(Compiler::variable), None, Precedence::None), // TokenType::Identifier
                 ParseRule::new(Some(Compiler::string), None, Precedence::None), // TokenType::String
                 ParseRule::new(Some(Compiler::number), None, Precedence::None), // TokenType::Number
-                ParseRule::new(None, None, Precedence::None), // TokenType::And
+                ParseRule::new(None, Some(Compiler::and), Precedence::And), // TokenType::And
                 ParseRule::new(None, None, Precedence::None), // TokenType::Class
                 ParseRule::new(None, None, Precedence::None), // TokenType::Else
                 ParseRule::new(Some(Compiler::literal), None, Precedence::None), // TokenType::False
@@ -897,7 +919,7 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
                 ParseRule::new(None, None, Precedence::None), // TokenType::Fun
                 ParseRule::new(None, None, Precedence::None), // TokenType::If
                 ParseRule::new(Some(Compiler::literal), None, Precedence::None), // TokenType::Nil
-                ParseRule::new(None, None, Precedence::None), // TokenType::Or
+                ParseRule::new(None, Some(Compiler::or), Precedence::Or), // TokenType::Or
                 ParseRule::new(None, None, Precedence::None), // TokenType::Print
                 ParseRule::new(None, None, Precedence::None), // TokenType::Return
                 ParseRule::new(None, None, Precedence::None), // TokenType::Super
@@ -949,6 +971,37 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
         };
 
         self.emit_bytes(OpCode::OpConstant.into(), index);
+    }
+
+    fn emit_jump(&mut self, instr: OpCode) -> usize {
+        self.emit_byte(instr.into());
+        self.emit_byte(0xff);
+        self.emit_byte(0xff);
+
+        return self.chunk.code.len() - 2;
+    }
+
+    fn patch_jump(&mut self, backpatch_idx: usize) {
+        let target = self.chunk.code.len() - backpatch_idx - 2;
+
+        if target as u16 > u16::MAX {
+            self.parser.error_at_previous("Too much code to jump over.");
+        }
+
+        self.chunk.code[backpatch_idx] = (target >> 8) as u8 & 0xff;
+        self.chunk.code[backpatch_idx + 1] = target as u8 & 0xff;
+    }
+
+    fn emit_loop(&mut self, start_idx: usize) {
+        self.emit_byte(OpCode::OpLoop.into());
+
+        let offset: u16 = (self.chunk.code.len() + 2) as u16 - start_idx as u16;
+        if offset > u16::MAX {
+            self.parser.error_at_previous("Loop body too large.");
+        }
+
+        self.emit_byte((offset >> 8) as u8 & 0xff);
+        self.emit_byte(offset as u8 & 0xff);
     }
 
     fn end_compilation(&mut self) {
@@ -1139,7 +1192,7 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
         if self.matches(TokenType::Var) {
             self.var_declaration();
         } else {
-        self.statement();
+            self.statement();
         }
 
         if self.parser.is_panic_mode {
@@ -1163,10 +1216,16 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
     fn statement(&mut self) {
         if self.matches(TokenType::Print) {
             self.print_statement();
+        } else if self.matches(TokenType::While) {
+            self.while_statement();
+        } else if self.matches(TokenType::For) {
+            self.for_statement();
         } else if self.matches(TokenType::LeftBrace) {
             self.begin_scope();
             self.block();
             self.end_scope();
+        } else if self.matches(TokenType::If) {
+            self.if_statement();
         } else {
             self.expression_statement();
         }
@@ -1176,6 +1235,88 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
         self.expression();
         self.consume(TokenType::Semicolon, "Expect ';' after value.");
         self.emit_byte(OpCode::OpPrint.into());
+    }
+
+    fn if_statement(&mut self) {
+        self.consume(TokenType::LeftParen, "Expect '(' after 'if'.");
+        self.expression();
+        self.consume(TokenType::RightParen, "Expect ')' after condition.");
+
+        let skip_then_backpatch_idx = self.emit_jump(OpCode::OpJumpIfFalse);
+        self.emit_byte(OpCode::OpPop.into());
+        self.statement();
+        let skip_else_backpatch_idx = self.emit_jump(OpCode::OpJump);
+
+        self.patch_jump(skip_then_backpatch_idx);
+        self.emit_byte(OpCode::OpPop.into());
+        if self.matches(TokenType::Else) {
+            self.statement();
+        }
+        self.patch_jump(skip_else_backpatch_idx);
+    }
+
+    fn while_statement(&mut self) {
+        let start_idx = self.chunk.code.len();
+
+        self.consume(TokenType::LeftParen, "Expect '(' after 'while'.");
+        self.expression();
+        self.consume(TokenType::RightParen, "Expect ')' after condition.");
+
+        let exit_backpatch_idx = self.emit_jump(OpCode::OpJumpIfFalse);
+        self.emit_byte(OpCode::OpPop.into());
+        self.statement();
+        self.emit_loop(start_idx);
+
+        self.patch_jump(exit_backpatch_idx);
+        self.emit_byte(OpCode::OpPop.into());
+    }
+
+    fn for_statement(&mut self) {
+        self.begin_scope();
+        
+        self.consume(TokenType::LeftParen, "Expect '(' after 'for'.");
+        if self.matches(TokenType::Semicolon) {
+        } else if self.matches(TokenType::Var) {
+            self.var_declaration();
+        } else {
+            self.expression_statement();
+        }
+
+        let mut loop_start_idx = self.chunk.code.len();
+        let mut exit_backpatch_idx: Option<usize> = None;
+        if !self.matches(TokenType::Semicolon) {
+            self.expression();
+            self.consume(TokenType::Semicolon, "Expect ';' after loop condition.");
+
+            exit_backpatch_idx = Some(self.emit_jump(OpCode::OpJumpIfFalse));
+            self.emit_byte(OpCode::OpPop.into());
+        }
+        
+        if !self.matches(TokenType::RightParen) {
+            let increment_backpatch_idx = self.emit_jump(OpCode::OpJump);
+            let increment_start_idx = self.chunk.code.len();
+
+            self.expression();
+            self.emit_byte(OpCode::OpPop.into());
+            self.consume(TokenType::RightParen, "Expect ')' after for clauses.");
+
+            self.emit_loop(loop_start_idx);
+            loop_start_idx = increment_start_idx;
+            self.patch_jump(increment_backpatch_idx);
+        }
+
+        self.statement();
+
+        self.emit_loop(loop_start_idx);
+        match exit_backpatch_idx {
+            Some(idx) => {
+                self.patch_jump(idx);
+                self.emit_byte(OpCode::OpPop.into());
+            }
+            None => {}
+        }
+
+        self.end_scope();
     }
 
     fn expression_statement(&mut self) {
@@ -1301,6 +1442,26 @@ impl<'chunk, 'compiler> Compiler<'chunk, 'compiler> {
 
         return -1;
     }
+
+    fn and(&mut self, can_assign: bool) {
+        let short_circuit_backpatch_idx = self.emit_jump(OpCode::OpJumpIfFalse);
+
+        self.emit_byte(OpCode::OpPop.into());
+        self.parse_precedence(Precedence::And);
+
+        self.patch_jump(short_circuit_backpatch_idx);
+    }
+
+    fn or(&mut self, can_assign: bool) {
+        let continue_backpatch_idx = self.emit_jump(OpCode::OpJumpIfFalse);
+        let short_circuit_backpatch_idx = self.emit_jump(OpCode::OpJump);
+
+        self.patch_jump(continue_backpatch_idx);
+        self.emit_byte(OpCode::OpPop.into());
+        
+        self.parse_precedence(Precedence::Or);
+        self.patch_jump(short_circuit_backpatch_idx);
+    }
 }
 
 fn disassemble_chunk(chunk: &Chunk, name: &str) {
@@ -1335,6 +1496,12 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         return offset + 2;
     }
 
+    fn jump_instruction(name: &str, sign: i16, chunk: &Chunk, offset: usize) -> usize {
+        let jump: i16 = (chunk.code[offset + 1] as i16) << 8 | chunk.code[offset + 2] as i16;
+        println!("{:<16} {:>4} -> {}", name, offset, offset as i16 + 3 + (sign * jump));
+        return offset + 3;
+    }
+
     print!("{:0>4} ", offset);
     if offset > 0 && chunk.lines.get(offset).unwrap() == chunk.lines.get(offset - 1).unwrap() {
         print!("   | ");
@@ -1365,6 +1532,9 @@ fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
         OpCode::OpSetGlobal => constant_instruction("OP_SET_GLOBAL", chunk, offset),
         OpCode::OpGetLocal => byte_instruction("OP_GET_LOCAL", chunk, offset),
         OpCode::OpSetLocal => byte_instruction("OP_SET_LOCAL", chunk, offset),
+        OpCode::OpJump => jump_instruction("OP_JUMP", 1, chunk, offset),
+        OpCode::OpJumpIfFalse => jump_instruction("OP_JUMP_IF_FALSE", 1, chunk, offset),
+        OpCode::OpLoop => jump_instruction("OP_LOOP", -1, chunk, offset),
     };
 }
 
