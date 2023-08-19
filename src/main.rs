@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env, fs,
-    io::{self, Write}, mem, time::{Instant, UNIX_EPOCH, SystemTime}
+    io::{self, Write}, mem, time::{UNIX_EPOCH, SystemTime}
 };
 
 use num_enum::{FromPrimitive, IntoPrimitive, TryFromPrimitive};
@@ -377,6 +377,7 @@ impl VM {
                 let native_function = self.native_functions[idx];
                 let result = native_function(arg_count);
                 self.stack_top -= arg_count + 1;
+                self.stack.truncate(self.stack_top);
                 self.push_stack(result);
                 return true;
             }
@@ -421,7 +422,6 @@ impl VM {
         self.native_functions.push(function);
         let function_idx = self.native_functions.len() - 1;
         let name_idx = self.strings.intern(name);
-        
 
         self.push_stack(Value::String(name_idx));
         self.push_stack(Value::NativeFunction(function_idx));
@@ -466,10 +466,33 @@ impl VM {
                 let frame = self.get_frame();
                 let chunk = self.get_chunk();
 
-                print!("          ");
-                for i in 0..self.stack_top {
-                    print!("[{:?}]", *self.stack.get(i).unwrap())
+                print!("STACK: [");
+                for i in &self.stack {
+                    print!("{i:?}, ");
                 }
+                println!("]");
+
+                print!("GLOBALS: [");
+                for i in &self.globals {
+                    print!("{i:?}, ");
+                }
+                println!("]");
+
+                print!("STRINGS: [");
+                for i in &self.strings.vec {
+                    print!("{i:?}, ");
+                }
+                println!("]");
+
+                print!("FUNCTIONS: [");
+                for i in &self.functions {
+                    print!("{}: {:?}, ", match i.name {
+                        Some(Value::String(idx)) => self.strings.lookup(idx),
+                        _ => "<script>",
+                    }, i.chunk.code);
+                }
+                println!("]");
+
                 println!();
 
                 disassemble_instruction(chunk, frame.ip);
@@ -480,13 +503,13 @@ impl VM {
                 OpCode::OpReturn => {
                     let result = self.pop_stack();
 
-                    self.frames.pop();
+                    self.stack_top = self.frames.pop().unwrap().stack_start;
+                    self.stack.truncate(self.stack_top);
+
                     if self.frames.is_empty() {
-                        self.pop_stack();
                         return InterpretResult::InterpretOk;
                     }
 
-                    self.stack_top = self.get_frame().stack_start;
                     self.push_stack(result);
                 }
                 OpCode::OpNegate => {
@@ -570,7 +593,7 @@ impl VM {
                 OpCode::OpGetLocal => {
                     let idx = self.read_byte() as usize;
                     let stack_start = self.get_frame().stack_start;
-                    self.push_stack(self.stack[stack_start + idx]);
+                    self.push_stack(self.stack[stack_start + 1 + idx]);
                 }
                 OpCode::OpSetLocal => {
                     let idx = self.read_byte() as usize;
@@ -983,7 +1006,7 @@ impl<'parser> Parser<'parser> {
             had_error: false,
             is_panic_mode: false,
             rules: [
-                ParseRule::new(Some(Parser::grouping), Some(Parser::call), Precedence::None), // TokenType::LeftParen
+                ParseRule::new(Some(Parser::grouping), Some(Parser::call), Precedence::Call), // TokenType::LeftParen
                 ParseRule::new(None, None, Precedence::None), // TokenType::RightParen
                 ParseRule::new(None, None, Precedence::None), // TokenType::LeftBrace
                 ParseRule::new(None, None, Precedence::None), // TokenType::RightBrace
@@ -1199,6 +1222,8 @@ impl<'parser> Parser<'parser> {
 
     fn function(&mut self, function_type: FunctionType) {
         let mut target = CompilationUnit::new(function_type);
+        let name_idx = self.compiler.strings.intern(self.previous.as_ref().unwrap().lexeme);
+        target.function.name = Some(Value::String(name_idx));
         mem::swap(&mut self.compiler.target, &mut target);
 
         self.compiler.begin_scope();
@@ -1636,14 +1661,15 @@ impl<'compiler, 'cu> Compiler<'compiler, 'cu> {
         while !parser.matches(TokenType::EOF) {
             parser.declaration();
         }
-        let function = parser.compiler.end_compilation(None);
+        parser.compiler.emit_return();
+        let function = parser.compiler.target.function;
 
         if env::var("DEBUG").is_ok() && !parser.had_error {
             let function_name: String = match function.name {
                 Some(Value::String(idx)) => parser.compiler.strings.lookup(idx).to_owned(),
                 _ => String::from("<script>"),
             };
-            let chunk: &Chunk = parser.compiler.get_chunk();
+            let chunk: &Chunk = &function.chunk;
 
             disassemble_chunk(chunk, &function_name);
         }
@@ -1868,10 +1894,7 @@ fn clock(arg_count: usize) -> Value {
     return Value::Number(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64());
 }
 
-fn repl() {
-    let mut vm: VM = VM::new();
-    vm.define_native_function("clock", clock);
-
+fn repl(vm: &mut VM) {
     let mut buffer = String::new();
     loop {
         print!("> ");
@@ -1891,17 +1914,20 @@ fn read_file(path: &str) -> String {
     return fs::read_to_string(path).unwrap();
 }
 
-fn run_file(path: &str) {
+fn run_file(vm: &mut VM, path: &str) {
     let source = read_file(path);
-    let mut vm: VM = VM::new();
     vm.interpret(&source);
 }
 
 fn main() {
+    let mut vm: VM = VM::new();
+
+    vm.define_native_function("clock", clock);
+
     let args: Vec<_> = env::args().collect();
     match args.len() {
-        1 => repl(),
-        2 => run_file(&args[1]),
+        1 => repl(&mut vm),
+        2 => run_file(&mut vm, &args[1]),
         _ => panic!("Usage: cargo run [-- <path>]"),
     }
 }
