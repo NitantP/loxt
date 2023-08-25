@@ -300,12 +300,12 @@ struct CallFrame {
 }
 
 impl CallFrame {
-    fn new(function: usize, stack_start: usize) -> Self {
+    fn new(function: usize, closure: usize, stack_start: usize) -> Self {
         Self {
             function,
             ip: 0,
             stack_start,
-            closure: 0,
+            closure,
         }
     }
 }
@@ -339,7 +339,7 @@ impl VM {
         match Compiler::compile(source, &mut self.strings, &mut self.functions) {
             Some(function) => {
                 self.functions.push(function);
-                self.frames.push(CallFrame::new(self.functions.len() - 1, 0));
+                self.frames.push(CallFrame::new(self.functions.len() - 1, 0, 0));
             }
             None => return InterpretResult::InterpretCompilerError,
         }
@@ -413,7 +413,7 @@ impl VM {
 
     fn call_value(&mut self, callee: Value, arg_count: usize) -> bool {
         return match callee {
-            Value::Function(idx) | Value::Closure(idx) => self.call(idx, arg_count),
+            Value::Closure(idx) => self.call(idx, arg_count),
             Value::NativeFunction(idx) => {
                 let native_function = self.native_functions[idx];
                 let result = native_function(arg_count);
@@ -434,7 +434,8 @@ impl VM {
     }
 
     fn call(&mut self, idx: usize, arg_count: usize) -> bool {
-        let function_arity = self.functions[idx].arity;
+        let function_idx = self.closures[idx].function_idx;
+        let function_arity = self.functions[function_idx].arity;
         if arg_count != function_arity {
             self.runtime_error(&format!("Expected {} arguments, but got {}.", function_arity, arg_count));
             return false;
@@ -445,7 +446,7 @@ impl VM {
             return false;
         }
 
-        let frame = CallFrame::new(idx, self.stack_top - arg_count - 1);
+        let frame = CallFrame::new(function_idx, idx, self.stack_top - arg_count - 1);
         self.frames.push(frame);
 
         return true;
@@ -638,7 +639,7 @@ impl VM {
                 OpCode::OpGetLocal => {
                     let idx = self.read_byte() as usize;
                     let stack_start = self.get_frame().stack_start;
-                    self.push_stack(self.stack[stack_start + 1 + idx]);
+                    self.push_stack(self.stack[stack_start + idx]);
                 }
                 OpCode::OpSetLocal => {
                     let idx = self.read_byte() as usize;
@@ -1335,8 +1336,6 @@ impl<'parser> Parser<'parser> {
         let constant_idx = self.compiler.get_chunk_mut().add_constant(idx).unwrap() as u8;
         self.compiler.emit_bytes(OpCode::OpClosure.into(), constant_idx);
 
-        println!("{:?}", function.upvalues);
-
         for x in &function.upvalues {
             self.compiler.emit_byte(x.is_local as u8);
             self.compiler.emit_byte(x.idx);
@@ -1625,10 +1624,10 @@ impl<'parser> Parser<'parser> {
                     match self.compiler.resolve_upvalue(name) {
                         -1 => (self.identifier_constant(name), OpCode::OpGetGlobal, OpCode::OpSetGlobal),
                         idx => (idx as u8, OpCode::OpGetUpvalue, OpCode::OpSetUpvalue),
+                        
                     }
                 }
                 idx => (idx as u8, OpCode::OpGetLocal, OpCode::OpSetLocal),
-                
             }
         };
 
@@ -1713,12 +1712,11 @@ impl<'cu> CompilationUnit<'cu> {
     }
 
     fn resolve_local(scope: &CompilationUnit, name: &str) -> i8 {
-        println!("{:?}", scope.locals);
-        for (idx, local) in scope.locals.iter().rev().enumerate() {
+        for (idx, local) in scope.locals.iter().enumerate().rev() {
             if name == local.name {
-                // if local.depth == -1 {
-                //     return (idx as i8, Some("Can't read local variable in its own initializer."));
-                // }
+                if local.depth == -1 {
+                    println!("Can't read local variable in its own initializer.");
+                }
                 return idx as i8;
             }
         }
@@ -1726,22 +1724,39 @@ impl<'cu> CompilationUnit<'cu> {
         return -1;
     }
 
-    fn resolve_upvalue(scope: &CompilationUnit, name: &str) -> (i8, bool) {
-        return match &scope.enclosing {
-            None => (-1, false),
+    fn resolve_upvalue(scope: &mut CompilationUnit, name: &str) -> i8 {
+        return match scope.enclosing.as_mut() {
+            None => -1,
             Some(enclosing) => {
                 match CompilationUnit::resolve_local(enclosing, name) {
                     -1 => {
-                        match CompilationUnit::resolve_upvalue(enclosing, name) {
-                            (-1, _) => (-1, false),
-                            (idx, _) => (idx, false),
-                        }
-                    },
-                    idx => (idx, true),
+                        let idx = CompilationUnit::resolve_upvalue(enclosing, name);
+                        scope.add_upvalue(idx as u8, false) as i8
+                    }
+                    idx => scope.add_upvalue(idx as u8, true) as i8,
                 }
             }
         }
     }
+
+    fn add_upvalue(&mut self, idx: u8, is_local: bool) -> usize {
+        for (i, x) in self.function.upvalues.iter().enumerate() {
+            if x.idx == idx && x.is_local == is_local {
+                return i;
+            }
+        }
+
+        if self.function.upvalues.len() as u8 == u8::MAX {
+            // error: "Too many closure variables in function."
+            return 0;
+        }
+
+        let upvalue = Upvalue::new(idx, is_local);
+        self.function.upvalues.push(upvalue);
+
+        return self.function.upvalues.len() - 1;
+    }
+
 }
 
 struct Compiler<'compiler, 'cu> {
@@ -1787,6 +1802,9 @@ impl<'compiler, 'cu> Compiler<'compiler, 'cu> {
             let chunk: &Chunk = &function.chunk;
 
             disassemble_chunk(strings, functions, chunk, &function_name);
+
+            disassemble_chunk(strings, functions, &functions[1].chunk, "outer");
+            disassemble_chunk(strings, functions, &functions[0].chunk, "inner");
         }
 
         return if had_error { None } else { Some(function) };
@@ -1915,28 +1933,7 @@ impl<'compiler, 'cu> Compiler<'compiler, 'cu> {
     }
 
     fn resolve_upvalue(&mut self, name: &str) -> i8 {
-        return match CompilationUnit::resolve_upvalue(&self.target, name) {
-            (-1, _) => -1,
-            (idx, is_local) => self.add_upvalue(idx as u8, is_local) as i8,
-        }
-    }
-
-    fn add_upvalue(&mut self, idx: u8, is_local: bool) -> usize {
-        for (i, x) in self.target.function.upvalues.iter().enumerate() {
-            if x.idx == idx && x.is_local == is_local {
-                return i;
-            }
-        }
-
-        if self.target.function.upvalues.len() as u8 == u8::MAX {
-            // error: "Too many closure variables in function."
-            return 0;
-        }
-
-        let upvalue = Upvalue::new(idx, is_local);
-        self.target.function.upvalues.push(upvalue);
-
-        return self.target.function.upvalues.len() - 1;
+        return CompilationUnit::resolve_upvalue(&mut self.target, name);
     }
 
     fn begin_scope(&mut self) {
@@ -2049,7 +2046,7 @@ fn disassemble_instruction(strings: &Interner, functions: &Vec<Function>, chunk:
             for _ in 0..function.upvalues.len() {
                 let is_local = chunk.code[offset];
                 let idx = chunk.code[offset + 1];
-                println!("{:>4}      |                     {} {}", offset, if is_local == 0 { "local" } else { "upvalue" }, idx);
+                println!("{:0>4}    |                     {} {}", offset, if is_local == 0 { "local" } else { "upvalue" }, idx);
 
                 offset += 2;
             }
@@ -2096,9 +2093,10 @@ fn main() {
     vm.define_native_function("clock", clock);
 
     let args: Vec<_> = env::args().collect();
-    match args.len() {
-        1 => repl(&mut vm),
-        2 => run_file(&mut vm, &args[1]),
-        _ => panic!("Usage: cargo run [-- <path>]"),
-    }
+    run_file(&mut vm, "../test/closures.lox");
+    // match args.len() {
+    //     1 => repl(&mut vm),
+    //     2 => run_file(&mut vm, &args[1]),
+    //     _ => panic!("Usage: cargo run [-- <path>]"),
+    // }
 }
