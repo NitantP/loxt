@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env, fs,
-    io::{self, Write}, mem, time::{UNIX_EPOCH, SystemTime}, num
+    io::{self, Write}, mem, time::{UNIX_EPOCH, SystemTime}
 };
 
 use num_enum::{FromPrimitive, IntoPrimitive, TryFromPrimitive};
@@ -53,6 +53,7 @@ enum Value {
     Function(usize),
     NativeFunction(usize),
     Closure(usize),
+    Upvalue(usize),
 }
 
 fn is_digit(c: char) -> bool {
@@ -156,6 +157,8 @@ fn are_equal(v1: &Value, v2: &Value) -> bool {
 struct Upvalue {
     idx: u8,
     is_local: bool,
+    value: Value,
+    is_closed: bool,
 }
 
 impl Upvalue {
@@ -163,6 +166,8 @@ impl Upvalue {
         Self {
             idx,
             is_local,
+            value: Value::Nil,
+            is_closed: false,
         }
     }
 }
@@ -213,6 +218,7 @@ enum OpCode {
     OpLoop,
     OpCall,
     OpClosure,
+    OpCloseUpvalue,
 }
 
 #[derive(Debug)]
@@ -319,6 +325,7 @@ struct VM {
     functions: Vec<Function>,
     closures: Vec<Closure>,
     native_functions: Vec<NativeFunction>,
+    open_upvalues: Vec<Upvalue>,
 }
 
 impl VM {
@@ -332,6 +339,7 @@ impl VM {
             functions: Vec::new(),
             closures: Vec::new(),
             native_functions: Vec::new(),
+            open_upvalues: Vec::new(),
         }
     }
 
@@ -342,6 +350,18 @@ impl VM {
                 self.frames.push(CallFrame::new(self.functions.len() - 1, 0, 0));
             }
             None => return InterpretResult::InterpretCompilerError,
+        }
+
+        if env::var("DEBUG").is_ok() {
+            for function in self.functions.iter() {
+                let function_name: String = match function.name {
+                    Some(Value::String(idx)) => self.strings.lookup(idx).to_owned(),
+                    _ => String::from("<script>"),
+                };
+                let chunk: &Chunk = &function.chunk;
+
+                disassemble_chunk(&self.strings, &self.functions, chunk, &function_name);
+            }
         }
 
         return self.run();
@@ -429,8 +449,50 @@ impl VM {
         }
     }
 
-    fn capture_upvalue(&mut self, local: Value) -> Value {
-        return local;
+    fn capture_upvalue(&mut self, stack_idx: usize) -> Value {
+        let mut insert_idx = 0;
+        for x in &self.open_upvalues {
+            let upvalue_idx = x.idx as usize;
+
+            // if upvalue_idx < stack_idx {
+            //     break;
+            // }
+
+            if !x.is_closed && upvalue_idx == stack_idx {
+                return Value::Upvalue(insert_idx);
+            }
+
+            insert_idx += 1;
+        }
+
+        let upvalue = Upvalue::new(stack_idx as u8, true);
+        // self.open_upvalues.insert(insert_idx , upvalue);
+        self.open_upvalues.push(upvalue);
+
+        insert_idx = self.open_upvalues.len() - 1;
+
+        return Value::Upvalue(insert_idx);
+    }
+
+    fn close_upvalues(&mut self, last: usize) {
+        if self.frames.len() == 0 {
+            return;
+        }
+
+        let stack_start = self.get_frame().stack_start;
+
+        for x in &mut self.open_upvalues {
+            let upvalue_idx = x.idx as usize;
+
+            if upvalue_idx < last {
+                break;
+            }
+
+            if !x.is_closed {
+                x.value = self.stack[stack_start + upvalue_idx].clone();
+                x.is_closed = true;
+            }
+        }
     }
 
     fn call(&mut self, idx: usize, arg_count: usize) -> bool {
@@ -549,7 +611,9 @@ impl VM {
                 OpCode::OpReturn => {
                     let result = self.pop_stack();
 
-                    self.stack_top = self.frames.pop().unwrap().stack_start;
+                    let stack_start = self.frames.pop().unwrap().stack_start;
+                    self.close_upvalues(stack_start);
+                    self.stack_top = stack_start;
                     self.stack.truncate(self.stack_top);
 
                     if self.frames.is_empty() {
@@ -606,6 +670,7 @@ impl VM {
                                 _ => println!("<script>"),
                             }
                         }
+                        Value::Upvalue(idx) => println!("<upvalue {idx}>"),
                         Value::NativeFunction(_) => println!("<native fn>"),
                         Value::Number(n) => println!("{}", n),
                         Value::Bool(b) => println!("{}", b),
@@ -648,13 +713,30 @@ impl VM {
                 }
                 OpCode::OpGetUpvalue => {
                     let slot = self.read_byte() as usize;
-                    let closure_idx = self.get_frame().closure;
-                    self.push_stack(self.closures[closure_idx].upvalues[slot]);
+                    let upvalue_idx = match self.closures[self.get_frame().closure].upvalues[slot] {
+                        Value::Upvalue(idx) => idx,
+                        _ => panic!("brah idk idx"),
+                    };
+                    let upvalue = &self.open_upvalues[upvalue_idx];
+
+                    if upvalue.is_closed {
+                        self.push_stack(upvalue.value);
+                    } else {
+                        self.push_stack(self.stack[upvalue.idx as usize].clone())
+                    }
                 },
                 OpCode::OpSetUpvalue => {
                     let slot = self.read_byte() as usize;
-                    let closure_idx = self.get_frame().closure;
-                    self.closures[closure_idx].upvalues[slot] = *self.peek(0);
+                    let upvalue_idx = match self.closures[self.get_frame().closure].upvalues[slot] {
+                        Value::Upvalue(idx) => idx,
+                        _ => panic!("brah idk idx"),
+                    };
+                    
+                    if  self.open_upvalues[upvalue_idx].is_closed {
+                        self.open_upvalues[upvalue_idx].value = self.peek(0).clone();
+                    } else {
+                        self.open_upvalues[upvalue_idx].idx = self.stack_top as u8 - 1;
+                    }
                 },
                 OpCode::OpJump => {
                     let offset = self.read_short();
@@ -687,8 +769,8 @@ impl VM {
 
                         closure.upvalues.push(
                             if is_local != 0 {
-                                let value = self.stack[self.get_frame().stack_start + idx].clone();
-                               self.capture_upvalue(value)
+                                let stack_idx = self.get_frame().stack_start + idx;
+                               self.capture_upvalue(stack_idx)
                             } else {
                                 let closure_idx = self.get_frame().closure;
                                 self.closures[closure_idx].upvalues[idx]
@@ -698,6 +780,10 @@ impl VM {
 
                     self.closures.push(closure);
                     self.push_stack(Value::Closure(self.closures.len() - 1));
+                }
+                OpCode::OpCloseUpvalue => {
+                    self.close_upvalues(self.stack_top - 1);
+                    self.pop_stack();
                 }
                 OpCode::OpSubtract => binary_op!(self, -, make_number),
                 OpCode::OpMultiply => binary_op!(self, *, make_number),
@@ -1304,8 +1390,10 @@ impl<'parser> Parser<'parser> {
         mem::swap(&mut self.compiler.target, &mut swap_target);
 
         let name_idx = self.compiler.strings.intern(self.previous.as_ref().unwrap().lexeme);
+        println!("swapped to compiling {name_idx}; leaving {:?} -> {:?}", swap_target.locals, swap_target.function.upvalues);
         self.compiler.target.function.name = Some(Value::String(name_idx));
         self.compiler.target.enclosing = Some(swap_target);
+
 
         self.compiler.begin_scope();
         self.consume(TokenType::LeftParen, "Expect '(' after function name.");
@@ -1330,6 +1418,7 @@ impl<'parser> Parser<'parser> {
         self.consume(TokenType::LeftBrace, "Expect '{' before function body.");
         self.block();
 
+        println!("swapping back, leaving {:?} -> {:?}", self.compiler.target.locals, self.compiler.target.function.upvalues);
         let function = self.compiler.end_compilation();
 
         let idx = Value::Closure(self.compiler.functions.len());
@@ -1617,6 +1706,7 @@ impl<'parser> Parser<'parser> {
 
     fn named_variable(&mut self, can_assign: bool) {
         let name = self.previous.as_ref().unwrap().lexeme;
+        println!("named: {name} in {:?}", self.compiler.target.function.name.unwrap_or(Value::String(100)));
 
         let (arg, get_op, set_op) = {
             match self.compiler.resolve_local(name) {
@@ -1681,13 +1771,15 @@ enum Precedence {
 struct Local<'compiler> {
     name: &'compiler str,
     depth: i8,
+    is_captured: bool
 }
 
 impl<'compiler> Local<'compiler> {
-    fn new(name: &'compiler str, depth: i8) -> Self {
+    fn new(name: &'compiler str, depth: i8, is_captured: bool) -> Self {
         Self {
             name,
             depth,
+            is_captured,
         }
     }
 }
@@ -1706,7 +1798,7 @@ impl<'cu> CompilationUnit<'cu> {
             enclosing,
             function: Function::new(),
             function_type,
-            locals: vec![Local::new("", 0)],
+            locals: vec![Local::new("", 0, false)],
             depth: 0,
         }
     }
@@ -1730,10 +1822,16 @@ impl<'cu> CompilationUnit<'cu> {
             Some(enclosing) => {
                 match CompilationUnit::resolve_local(enclosing, name) {
                     -1 => {
-                        let idx = CompilationUnit::resolve_upvalue(enclosing, name);
-                        scope.add_upvalue(idx as u8, false) as i8
+                        // @note upvalue to resolve is not on the stack - it's a global?
+                        match CompilationUnit::resolve_upvalue(enclosing, name) {
+                            -1 => -1,
+                            idx => scope.add_upvalue(idx as u8, false) as i8,
+                        }
                     }
-                    idx => scope.add_upvalue(idx as u8, true) as i8,
+                    idx => {
+                        enclosing.locals[idx as usize].is_captured = true;
+                        scope.add_upvalue(idx as u8, true) as i8
+                    }
                 }
             }
         }
@@ -1793,20 +1891,6 @@ impl<'compiler, 'cu> Compiler<'compiler, 'cu> {
         let had_error = parser.had_error;
 
         let function = parser.compiler.target.function;
-
-        if env::var("DEBUG").is_ok() && !had_error{
-            let function_name: String = match function.name {
-                Some(Value::String(idx)) => parser.compiler.strings.lookup(idx).to_owned(),
-                _ => String::from("<script>"),
-            };
-            let chunk: &Chunk = &function.chunk;
-
-            disassemble_chunk(strings, functions, chunk, &function_name);
-
-            disassemble_chunk(strings, functions, &functions[1].chunk, "outer");
-            disassemble_chunk(strings, functions, &functions[0].chunk, "inner");
-        }
-
         return if had_error { None } else { Some(function) };
     }
 
@@ -1885,6 +1969,8 @@ impl<'compiler, 'cu> Compiler<'compiler, 'cu> {
     }
 
     fn declare_variable(&mut self, name: &'cu str) -> Result<i8, String> {
+        // @note: globals don't get pushed to the locals stack, so they can't be captured by
+        // upvalues?
         if self.target.depth != 0 {
             for local in self.target.locals.iter().rev() {
                 if local.depth != -1 && local.depth < self.target.depth {
@@ -1928,7 +2014,7 @@ impl<'compiler, 'cu> Compiler<'compiler, 'cu> {
             return Err("Too many local variables in function.");
         }
 
-        self.target.locals.push(Local::new(name, -1));
+        self.target.locals.push(Local::new(name, -1, false));
         return Ok(self.target.locals.len() - 1);
     }
 
@@ -1946,8 +2032,12 @@ impl<'compiler, 'cu> Compiler<'compiler, 'cu> {
         loop {
             match self.target.locals.last() {
                 Some(x) if x.depth > self.target.depth => {
+                    if x.is_captured {
+                        self.emit_byte(OpCode::OpCloseUpvalue.into());
+                    } else {
+                        self.emit_byte(OpCode::OpPop.into());
+                    }
                     self.target.locals.pop();
-                    self.emit_byte(OpCode::OpPop.into())
                 }
                 _ => break,
             }
@@ -2037,7 +2127,7 @@ fn disassemble_instruction(strings: &Interner, functions: &Vec<Function>, chunk:
             let function = &functions[function_idx];
 
             match function.name {
-                Some(Value::String(name)) =>println!("<fn {}>", strings.lookup(name)), 
+                Some(Value::String(name)) => println!("<fn {}>", strings.lookup(name)), 
                 _ => println!("<script>"),
             }
 
@@ -2055,6 +2145,7 @@ fn disassemble_instruction(strings: &Interner, functions: &Vec<Function>, chunk:
         }
         OpCode::OpGetUpvalue => byte_instruction("OP_GET_VALUE", chunk, offset),
         OpCode::OpSetUpvalue => byte_instruction("OP_SET_VALUE", chunk, offset),
+        OpCode::OpCloseUpvalue => simple_instruction("OP_CLOSE_UPVALUE", offset),
     };
 }
 
