@@ -1,0 +1,9 @@
+class Pair {}
+var pair = Pair();
+print Pair;
+print pair;
+
+print pair.first = 1;
+print pair.second = 2;
+
+print pair.first + pair.second;

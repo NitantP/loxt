@@ -1,0 +1,30 @@
+var globalOne;
+var globalTwo;
+
+fun main() {
+  var a = "one";
+  {
+    fun one() {
+      print a;
+    }
+    globalOne = one;
+  }
+
+  a = "two";
+  {
+    fun two() {
+      print a;
+    }
+    globalTwo = two;
+  }
+
+  a = "three";
+  fun three() {
+    print a;
+  }
+  three();
+}
+
+main();
+globalTwo();
+globalOne();

@@ -54,6 +54,8 @@ enum Value {
     NativeFunction(usize),
     Closure(usize),
     Upvalue(usize),
+    Class(usize),
+    Instance(usize),
 }
 
 fn is_digit(c: char) -> bool {
@@ -219,6 +221,9 @@ enum OpCode {
     OpCall,
     OpClosure,
     OpCloseUpvalue,
+    OpClass,
+    OpGetProperty,
+    OpSetProperty,
 }
 
 #[derive(Debug)]
@@ -290,6 +295,32 @@ impl Closure {
     }
 }
 
+struct Class {
+    name: Value,
+}
+
+impl Class {
+    fn new(name: Value) -> Self {
+        Self {
+            name,
+        }
+    }
+}
+
+struct Instance {
+    class: usize,
+    fields: HashMap<usize, Value>,
+}
+
+impl Instance {
+    fn new(class: usize) -> Self {
+        Self {
+            class,
+            fields: HashMap::new(),
+        }
+    }
+}
+
 #[derive(IntoPrimitive, TryFromPrimitive)]
 #[repr(u8)]
 enum InterpretResult {
@@ -324,6 +355,8 @@ struct VM {
     globals: HashMap<usize, Value>,
     functions: Vec<Function>,
     closures: Vec<Closure>,
+    classes: Vec<Class>,
+    instances: Vec<Instance>,
     native_functions: Vec<NativeFunction>,
     open_upvalues: Vec<Upvalue>,
 }
@@ -338,6 +371,8 @@ impl VM {
             globals: HashMap::new(),
             functions: Vec::new(),
             closures: Vec::new(),
+            classes: Vec::new(),
+            instances: Vec::new(),
             native_functions: Vec::new(),
             open_upvalues: Vec::new(),
         }
@@ -440,7 +475,13 @@ impl VM {
                 self.stack_top -= arg_count + 1;
                 self.stack.truncate(self.stack_top);
                 self.push_stack(result);
-                return true;
+                true
+            }
+            Value::Class(idx) => {
+                let instance = Instance::new(idx);
+                self.instances.push(instance);
+                self.stack[self.stack_top - 1 - arg_count] = Value::Instance(self.instances.len() - 1);
+                true
             }
             _ => {
                 self.runtime_error("Can only call functions and classes.");
@@ -666,8 +707,21 @@ impl VM {
                         Value::String(idx) => println!("{}", self.strings.lookup(idx)),
                         Value::Function(idx) | Value::Closure(idx) => {
                             match self.functions.get(idx).unwrap().name {
-                                Some(Value::String(name)) =>println!("<fn {}>", self.strings.lookup(name)), 
+                                Some(Value::String(name)) => println!("<fn {}>", self.strings.lookup(name)), 
                                 _ => println!("<script>"),
+                            }
+                        }
+                        Value::Class(idx) => {
+                            match self.classes.get(idx).unwrap().name {
+                                Value::String(idx) => println!("<class {}>", self.strings.lookup(idx)),
+                                _ => println!("<class>"),
+                            }
+                        }
+                        Value::Instance(idx) => {
+                            let class_idx = self.instances[idx].class;
+                            match self.classes.get(class_idx).unwrap().name {
+                                Value::String(idx) => println!("<{} instance>", self.strings.lookup(idx)),
+                                _ => println!("<instance>"),
                             }
                         }
                         Value::Upvalue(idx) => println!("<upvalue {idx}>"),
@@ -785,6 +839,55 @@ impl VM {
                     self.close_upvalues(self.stack_top - 1);
                     self.pop_stack();
                 }
+                OpCode::OpClass => {
+                    let class = Class::new(self.read_constant());
+                    self.classes.push(class);
+                    self.push_stack(Value::Class(self.classes.len() - 1));
+                }
+                OpCode::OpGetProperty => {
+                    let instance = match *self.peek(0) {
+                        Value::Instance(idx) => idx,
+                        _ => {
+                            self.runtime_error("Only instances have properties.");
+                            return InterpretResult::InterpretRuntimeError;
+                        }
+                    };
+                    let name = match self.read_constant() {
+                        Value::String(idx) => idx,
+                        v => panic!("Expected property name string on stack, but received {:?}", v),
+                    };
+
+                    match self.instances[instance].fields.get(&name) {
+                        Some(&value) => {
+                            self.pop_stack();
+                            self.push_stack(value);
+                        }
+                        _ => {
+                            let name = self.strings.lookup(name);
+                            self.runtime_error(&format!("Undefined property '{name}'."));
+                            return InterpretResult::InterpretRuntimeError;
+                        }
+                    }
+                },
+                OpCode::OpSetProperty => {
+                    let instance = match *self.peek(1) {
+                        Value::Instance(idx) => idx,
+                        _ => {
+                            self.runtime_error("Only instances have properties.");
+                            return InterpretResult::InterpretRuntimeError;
+                        }
+                    };
+                    let name = match self.read_constant() {
+                        Value::String(idx) => idx,
+                        v => panic!("Expected property name string on stack, but received {:?}", v),
+                    };
+
+                    let value = self.pop_stack();
+                    self.instances[instance].fields.insert(name, value);
+
+                    self.pop_stack();
+                    self.push_stack(value);
+                },
                 OpCode::OpSubtract => binary_op!(self, -, make_number),
                 OpCode::OpMultiply => binary_op!(self, *, make_number),
                 OpCode::OpDivide => binary_op!(self, /, make_number),
@@ -1176,7 +1279,7 @@ impl<'parser> Parser<'parser> {
                 ParseRule::new(None, None, Precedence::None), // TokenType::LeftBrace
                 ParseRule::new(None, None, Precedence::None), // TokenType::RightBrace
                 ParseRule::new(None, None, Precedence::None), // TokenType::Comma
-                ParseRule::new(None, None, Precedence::None), // TokenType::Dot
+                ParseRule::new(None, Some(Parser::dot), Precedence::Call), // TokenType::Dot
                 ParseRule::new(
                     Some(Parser::unary),
                     Some(Parser::binary),
@@ -1365,7 +1468,9 @@ impl<'parser> Parser<'parser> {
     }
 
     fn declaration(&mut self) {
-        if self.matches(TokenType::Fun) {
+        if self.matches(TokenType::Class) {
+            self.class_declaration();
+        } else if self.matches(TokenType::Fun) {
             self.fun_declaration();
         } else if self.matches(TokenType::Var) {
             self.var_declaration();
@@ -1376,6 +1481,22 @@ impl<'parser> Parser<'parser> {
         if self.is_panic_mode {
             self.synchronize();
         }
+    }
+
+    fn class_declaration(&mut self) {
+        self.consume(TokenType::Identifier, "Expect class name.");
+        let class_name = self.previous.as_ref().unwrap().lexeme;
+        let constant_idx = self.identifier_constant(class_name);
+        match self.compiler.declare_variable(class_name) {
+            Ok(_) => {},
+            Err(message) => self.error_at_previous(&message),
+        }
+
+        self.compiler.emit_bytes(OpCode::OpClass.into(), constant_idx);
+        self.compiler.define_variable(constant_idx);
+
+        self.consume(TokenType::LeftBrace, "Expect '{' before class body.");
+        self.consume(TokenType::RightBrace, "Expect '}' after class body.");
     }
 
     fn fun_declaration(&mut self) {
@@ -1656,6 +1777,19 @@ impl<'parser> Parser<'parser> {
         self.compiler.emit_bytes(OpCode::OpCall.into(), arg_count);
     }
 
+    fn dot(&mut self, can_assign: bool) {
+        self.consume(TokenType::Identifier, "Expect property name after '.'.");
+        let name = self.previous.as_ref().unwrap().lexeme;
+        let constant_idx = self.identifier_constant(name);
+
+        if can_assign && self.matches(TokenType::Equal) {
+            self.expression();
+            self.compiler.emit_bytes(OpCode::OpSetProperty.into(), constant_idx);
+        } else {
+            self.compiler.emit_bytes(OpCode::OpGetProperty.into(), constant_idx);
+        }
+    }
+
     fn literal(&mut self, can_assign: bool) {
         match self.previous.as_ref().unwrap().r#type {
             TokenType::False => self.compiler.emit_byte(OpCode::OpFalse.into()),
@@ -1706,7 +1840,6 @@ impl<'parser> Parser<'parser> {
 
     fn named_variable(&mut self, can_assign: bool) {
         let name = self.previous.as_ref().unwrap().lexeme;
-        println!("named: {name} in {:?}", self.compiler.target.function.name.unwrap_or(Value::String(100)));
 
         let (arg, get_op, set_op) = {
             match self.compiler.resolve_local(name) {
@@ -2146,6 +2279,9 @@ fn disassemble_instruction(strings: &Interner, functions: &Vec<Function>, chunk:
         OpCode::OpGetUpvalue => byte_instruction("OP_GET_VALUE", chunk, offset),
         OpCode::OpSetUpvalue => byte_instruction("OP_SET_VALUE", chunk, offset),
         OpCode::OpCloseUpvalue => simple_instruction("OP_CLOSE_UPVALUE", offset),
+        OpCode::OpClass => constant_instruction("OP_CLASS", chunk, offset),
+        OpCode::OpGetProperty => constant_instruction("OP_GET_PROPERTY", chunk, offset),
+        OpCode::OpSetProperty => constant_instruction("OP_SET_PROPERTY", chunk, offset),
     };
 }
 
@@ -2184,10 +2320,9 @@ fn main() {
     vm.define_native_function("clock", clock);
 
     let args: Vec<_> = env::args().collect();
-    run_file(&mut vm, "../test/closures.lox");
-    // match args.len() {
-    //     1 => repl(&mut vm),
-    //     2 => run_file(&mut vm, &args[1]),
-    //     _ => panic!("Usage: cargo run [-- <path>]"),
-    // }
+    match args.len() {
+        1 => repl(&mut vm),
+        2 => run_file(&mut vm, &args[1]),
+        _ => panic!("Usage: cargo run [-- <path>]"),
+    }
 }
