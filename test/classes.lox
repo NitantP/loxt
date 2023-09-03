@@ -7,3 +7,59 @@ print pair.first = 1;
 print pair.second = 2;
 
 print pair.first + pair.second;
+
+class Scone {
+  topping(first, second) {
+    print "scone with " + first + " and " + second;
+  }
+}
+
+var scone = Scone();
+scone.topping("berries", "cream");
+
+// print this;
+// fun notMethod() {
+//   print this;
+// }
+
+class Nested {
+  method() {
+    fun function() {
+      print this;
+    }
+
+    function();
+  }
+}
+
+Nested().method();
+
+class CoffeeMaker {
+  init(coffee) {
+    this.coffee = coffee;
+  }
+
+  brew() {
+    print "Enjoy your cup of " + this.coffee;
+
+    // No reusing the grounds!
+    this.coffee = "- wait there's nothing to brew!";
+  }
+}
+
+var maker = CoffeeMaker("coffee and chicory");
+maker.brew();
+maker.brew();
+
+class Oops {
+  init() {
+    fun f() {
+      print "not a method";
+    }
+
+    this.field = f;
+  }
+}
+
+var oops = Oops();
+oops.field();
