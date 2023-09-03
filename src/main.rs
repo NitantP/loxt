@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    env, fs,
+    env::{self, args}, fs,
     io::{self, Write}, mem, time::{UNIX_EPOCH, SystemTime}
 };
 
@@ -56,6 +56,7 @@ enum Value {
     Upvalue(usize),
     Class(usize),
     Instance(usize),
+    BoundMethod(usize),
 }
 
 fn is_digit(c: char) -> bool {
@@ -102,6 +103,13 @@ fn as_string_idx(value: Value) -> usize {
 fn as_function_idx(value: Value) -> usize {
     match value {
         Value::Function(idx) | Value::Closure(idx) => idx,
+        _ => usize::MAX,
+    }
+}
+
+fn as_class_idx(value: Value) -> usize {
+    match value {
+        Value::Class(idx) => idx,
         _ => usize::MAX,
     }
 }
@@ -224,6 +232,8 @@ enum OpCode {
     OpClass,
     OpGetProperty,
     OpSetProperty,
+    OpMethod,
+    OpInvoke,
 }
 
 #[derive(Debug)]
@@ -257,6 +267,8 @@ impl Chunk {
 enum FunctionType {
     Function,
     Script,
+    Method,
+    Initializer,
 }
 
 struct Function {
@@ -297,12 +309,14 @@ impl Closure {
 
 struct Class {
     name: Value,
+    methods: HashMap<usize, Value>
 }
 
 impl Class {
     fn new(name: Value) -> Self {
         Self {
             name,
+            methods: HashMap::new(),
         }
     }
 }
@@ -317,6 +331,20 @@ impl Instance {
         Self {
             class,
             fields: HashMap::new(),
+        }
+    }
+}
+
+struct BoundMethod {
+    receiver: Value,
+    method: Value,
+}
+
+impl BoundMethod {
+    fn new(receiver: Value, method: Value) -> Self {
+        Self {
+            receiver,
+            method
         }
     }
 }
@@ -357,22 +385,29 @@ struct VM {
     closures: Vec<Closure>,
     classes: Vec<Class>,
     instances: Vec<Instance>,
+    init_string: usize,
+    bound_methods: Vec<BoundMethod>,
     native_functions: Vec<NativeFunction>,
     open_upvalues: Vec<Upvalue>,
 }
 
 impl VM {
     fn new() -> Self {
+        let mut strings = Interner::new();
+        let init_string = strings.intern("init");
+
         Self {
             frames: Vec::with_capacity(FRAMES_MAX),
             stack: Vec::with_capacity(STACK_MAX),
             stack_top: 0,
-            strings: Interner::new(),
+            strings,
             globals: HashMap::new(),
             functions: Vec::new(),
             closures: Vec::new(),
             classes: Vec::new(),
             instances: Vec::new(),
+            init_string,
+            bound_methods: Vec::new(),
             native_functions: Vec::new(),
             open_upvalues: Vec::new(),
         }
@@ -469,6 +504,11 @@ impl VM {
     fn call_value(&mut self, callee: Value, arg_count: usize) -> bool {
         return match callee {
             Value::Closure(idx) => self.call(idx, arg_count),
+            Value::BoundMethod(idx) => {
+                let bound_method = &self.bound_methods[idx];
+                self.stack[self.stack_top - 1 - arg_count] = bound_method.receiver;
+                self.call(as_function_idx(bound_method.method), arg_count)
+            }
             Value::NativeFunction(idx) => {
                 let native_function = self.native_functions[idx];
                 let result = native_function(arg_count);
@@ -481,10 +521,41 @@ impl VM {
                 let instance = Instance::new(idx);
                 self.instances.push(instance);
                 self.stack[self.stack_top - 1 - arg_count] = Value::Instance(self.instances.len() - 1);
+
+                let class = &self.classes[idx];
+                match class.methods.get(&self.init_string) {
+                    Some(&value) => return self.call(as_function_idx(value), arg_count),
+                    _ => {}
+                }
+
+                if arg_count != 0 {
+                    self.runtime_error(&format!("Expected 0 arguments but got {arg_count}."));
+                    return false;
+                }
+
                 true
             }
             _ => {
                 self.runtime_error("Can only call functions and classes.");
+                false
+            }
+        }
+    }
+
+    fn bind_method(&mut self, class: usize, name: usize) -> bool {
+        let class = &self.classes[class];
+        return match class.methods.get(&name) {
+            Some(method) => {
+                let bound_method = BoundMethod::new(*self.peek(0), *method);
+                self.pop_stack();
+
+                self.bound_methods.push(bound_method);
+                self.push_stack(Value::BoundMethod(self.bound_methods.len() - 1));
+                true
+            }
+            None => {
+                let name = self.strings.lookup(name);
+                self.runtime_error(&format!("Undefined property '{name}'"));
                 false
             }
         }
@@ -534,6 +605,14 @@ impl VM {
                 x.is_closed = true;
             }
         }
+    }
+
+    fn define_method(&mut self, name: usize) {
+        let method = *self.peek(0);
+        let class_idx = as_class_idx(*self.peek(1));
+
+        self.classes[class_idx].methods.insert(name, method);
+        self.pop_stack();
     }
 
     fn call(&mut self, idx: usize, arg_count: usize) -> bool {
@@ -711,6 +790,14 @@ impl VM {
                                 _ => println!("<script>"),
                             }
                         }
+                        Value::BoundMethod(idx) => {
+                            let bound_method = &self.bound_methods[idx];
+                            let method = &self.closures[as_function_idx(bound_method.method)];
+                            match self.functions[method.function_idx].name {
+                                Some(Value::String(name)) => println!("<fn {}>", self.strings.lookup(name)), 
+                                _ => println!("<script>"),
+                            }
+                        }
                         Value::Class(idx) => {
                             match self.classes.get(idx).unwrap().name {
                                 Value::String(idx) => println!("<class {}>", self.strings.lookup(idx)),
@@ -857,15 +944,16 @@ impl VM {
                         v => panic!("Expected property name string on stack, but received {:?}", v),
                     };
 
-                    match self.instances[instance].fields.get(&name) {
+                    let instance = &self.instances[instance];
+                    match instance.fields.get(&name) {
                         Some(&value) => {
                             self.pop_stack();
                             self.push_stack(value);
                         }
                         _ => {
-                            let name = self.strings.lookup(name);
-                            self.runtime_error(&format!("Undefined property '{name}'."));
-                            return InterpretResult::InterpretRuntimeError;
+                            if !self.bind_method(instance.class, name) {
+                                return InterpretResult::InterpretRuntimeError;
+                            }
                         }
                     }
                 },
@@ -888,6 +976,14 @@ impl VM {
                     self.pop_stack();
                     self.push_stack(value);
                 },
+                OpCode::OpMethod => {
+                    let name = match self.read_constant() {
+                        Value::String(idx) => idx,
+                        v => panic!("Expected method name string on stack, but received {:?}", v),
+                    };
+                    self.define_method(name);
+                }
+                OpCode::OpInvoke => {},
                 OpCode::OpSubtract => binary_op!(self, -, make_number),
                 OpCode::OpMultiply => binary_op!(self, *, make_number),
                 OpCode::OpDivide => binary_op!(self, /, make_number),
@@ -1312,7 +1408,7 @@ impl<'parser> Parser<'parser> {
                 ParseRule::new(None, None, Precedence::None), // TokenType::Print
                 ParseRule::new(None, None, Precedence::None), // TokenType::Return
                 ParseRule::new(None, None, Precedence::None), // TokenType::Super
-                ParseRule::new(None, None, Precedence::None), // TokenType::This
+                ParseRule::new(Some(Parser::this), None, Precedence::None), // TokenType::This
                 ParseRule::new(Some(Parser::literal), None, Precedence::None), // TokenType::True
                 ParseRule::new(None, None, Precedence::None), // TokenType::Var
                 ParseRule::new(None, None, Precedence::None), // TokenType::While
@@ -1495,8 +1591,21 @@ impl<'parser> Parser<'parser> {
         self.compiler.emit_bytes(OpCode::OpClass.into(), constant_idx);
         self.compiler.define_variable(constant_idx);
 
+        let mut compilation_class = Some(Box::new(CompilationClass::new(None)));
+        mem::swap(&mut self.compiler.class, &mut compilation_class);
+
+        self.named_variable(false);
+
         self.consume(TokenType::LeftBrace, "Expect '{' before class body.");
+
+        while !self.check(TokenType::RightBrace) && !self.check(TokenType::EOF) {
+            self.method();
+        }
+
         self.consume(TokenType::RightBrace, "Expect '}' after class body.");
+        self.compiler.emit_byte(OpCode::OpPop.into());
+
+        mem::swap(&mut self.compiler.class, &mut compilation_class);
     }
 
     fn fun_declaration(&mut self) {
@@ -1511,7 +1620,6 @@ impl<'parser> Parser<'parser> {
         mem::swap(&mut self.compiler.target, &mut swap_target);
 
         let name_idx = self.compiler.strings.intern(self.previous.as_ref().unwrap().lexeme);
-        println!("swapped to compiling {name_idx}; leaving {:?} -> {:?}", swap_target.locals, swap_target.function.upvalues);
         self.compiler.target.function.name = Some(Value::String(name_idx));
         self.compiler.target.enclosing = Some(swap_target);
 
@@ -1539,7 +1647,6 @@ impl<'parser> Parser<'parser> {
         self.consume(TokenType::LeftBrace, "Expect '{' before function body.");
         self.block();
 
-        println!("swapping back, leaving {:?} -> {:?}", self.compiler.target.locals, self.compiler.target.function.upvalues);
         let function = self.compiler.end_compilation();
 
         let idx = Value::Closure(self.compiler.functions.len());
@@ -1552,6 +1659,22 @@ impl<'parser> Parser<'parser> {
         }
 
         self.compiler.functions.push(function);
+    }
+
+    fn method(&mut self) {
+        self.consume(TokenType::Identifier, "Expect method name.");
+        let name = self.previous.as_ref().unwrap().lexeme;
+        let constant_idx = self.identifier_constant(name);
+
+        self.function(
+            if name == "init" {
+                FunctionType::Initializer
+            } else {
+                FunctionType::Method
+            }
+        );
+
+        self.compiler.emit_bytes(OpCode::OpMethod.into(), constant_idx);
     }
 
     fn var_declaration(&mut self) {
@@ -1601,6 +1724,10 @@ impl<'parser> Parser<'parser> {
         if self.matches(TokenType::Semicolon) {
             self.compiler.emit_return();
         } else {
+            if self.compiler.target.function_type == FunctionType::Initializer {
+                self.error_at_previous("Can't return a value from an initializer.");
+            }
+
             self.expression();
             self.consume(TokenType::Semicolon, "Expect ';' after return value.");
             self.compiler.emit_byte(OpCode::OpReturn.into());
@@ -1811,6 +1938,15 @@ impl<'parser> Parser<'parser> {
         self.named_variable(can_assign);
     }
 
+    fn this(&mut self, can_assign: bool) {
+        if self.compiler.class.is_none() {
+            self.error_at_previous("Can't use 'this' outside of a class.");
+            return;
+        }
+
+        self.variable(false);
+    }
+
     fn identifier_constant(&mut self, name: &str) -> u8 {
         let idx = self.compiler.strings.intern(name);
         return self.compiler.get_chunk_mut().add_constant(Value::String(idx)).unwrap() as u8;
@@ -1917,6 +2053,16 @@ impl<'compiler> Local<'compiler> {
     }
 }
 
+struct CompilationClass {
+    enclosing: Option<Box<CompilationClass>>,
+}
+
+impl CompilationClass {
+    fn new(enclosing: Option<Box<CompilationClass>>) -> Self {
+        Self { enclosing }
+    }
+}
+
 struct CompilationUnit<'cu> {
     enclosing: Option<Box<CompilationUnit<'cu>>>,
     function: Function,
@@ -1930,8 +2076,14 @@ impl<'cu> CompilationUnit<'cu> {
         Self {
             enclosing,
             function: Function::new(),
+            locals: vec![
+                if function_type != FunctionType::Function {
+                    Local::new("this", 0, false)
+                } else {
+                    Local::new("", 0, false)
+                }
+            ],
             function_type,
-            locals: vec![Local::new("", 0, false)],
             depth: 0,
         }
     }
@@ -1994,6 +2146,7 @@ struct Compiler<'compiler, 'cu> {
     strings: &'compiler mut Interner,
     functions: &'compiler mut Vec<Function>,
     target: Box<CompilationUnit<'cu>>,
+    class: Option<Box<CompilationClass>>,
 }
 
 impl<'compiler, 'cu> Compiler<'compiler, 'cu> {
@@ -2002,6 +2155,7 @@ impl<'compiler, 'cu> Compiler<'compiler, 'cu> {
             strings,
             functions,
             target: Box::new(CompilationUnit::new(None, FunctionType::Script)),
+            class: None,
         }
     }
 
@@ -2037,7 +2191,11 @@ impl<'compiler, 'cu> Compiler<'compiler, 'cu> {
     }
 
     fn emit_return(&mut self) {
-        self.emit_byte(OpCode::OpNil.into());
+        if self.target.function_type == FunctionType::Initializer {
+            self.emit_bytes(OpCode::OpGetLocal.into(), 0)
+        } else {
+            self.emit_byte(OpCode::OpNil.into());
+        }
         self.emit_byte(OpCode::OpReturn.into());
     }
 
@@ -2282,6 +2440,8 @@ fn disassemble_instruction(strings: &Interner, functions: &Vec<Function>, chunk:
         OpCode::OpClass => constant_instruction("OP_CLASS", chunk, offset),
         OpCode::OpGetProperty => constant_instruction("OP_GET_PROPERTY", chunk, offset),
         OpCode::OpSetProperty => constant_instruction("OP_SET_PROPERTY", chunk, offset),
+        OpCode::OpMethod => constant_instruction("OP_METHOD", chunk, offset),
+        OpCode::OpInvoke => 0,
     };
 }
 
