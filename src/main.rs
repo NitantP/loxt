@@ -114,6 +114,13 @@ fn as_class_idx(value: Value) -> usize {
     }
 }
 
+fn as_instance_idx(value: Value) -> usize {
+    match value {
+        Value::Instance(idx) => idx,
+        _ => usize::MAX,
+    }
+}
+
 fn is_number(value: &Value) -> bool {
     match value {
         Value::Number(_) => true,
@@ -540,6 +547,38 @@ impl VM {
                 false
             }
         }
+    }
+
+    fn invoke_from_class(&mut self, class: usize, name: usize, arg_count: usize) -> bool {
+        let class = &self.classes[class];
+        match class.methods.get(&name) {
+            Some(value) => self.call(as_function_idx(*value), arg_count),
+            _ => {
+                let name = self.strings.lookup(name);
+                self.runtime_error(&format!("Undefined property '{name}'"));
+                return false;
+            }
+        }
+    }
+
+    fn invoke(&mut self, name: usize, arg_count: usize) -> bool {
+        match *self.peek(arg_count) {
+            Value::Instance(idx) => {
+                let instance = &self.instances[idx];
+                
+                if let Some(&value) = instance.fields.get(&name) {
+                    self.stack[self.stack_top - 1 - arg_count] = value;
+                    return self.call_value(value, arg_count);
+                }
+
+                return self.invoke_from_class(instance.class, name, arg_count);
+            }
+            _ => {
+                self.runtime_error("Only instances have methods.");
+                return false;
+            }
+        }
+        
     }
 
     fn bind_method(&mut self, class: usize, name: usize) -> bool {
@@ -983,7 +1022,17 @@ impl VM {
                     };
                     self.define_method(name);
                 }
-                OpCode::OpInvoke => {},
+                OpCode::OpInvoke => {
+                    let method_name = match self.read_constant() {
+                        Value::String(idx) => idx,
+                        v => panic!("Expected method name string on stack, but received {:?}", v),
+                    };
+                    let arg_count = self.read_byte();
+                    
+                    if !self.invoke(method_name, arg_count.into()) {
+                        return InterpretResult::InterpretRuntimeError;
+                    }
+                },
                 OpCode::OpSubtract => binary_op!(self, -, make_number),
                 OpCode::OpMultiply => binary_op!(self, *, make_number),
                 OpCode::OpDivide => binary_op!(self, /, make_number),
@@ -1912,6 +1961,10 @@ impl<'parser> Parser<'parser> {
         if can_assign && self.matches(TokenType::Equal) {
             self.expression();
             self.compiler.emit_bytes(OpCode::OpSetProperty.into(), constant_idx);
+        } else if self.matches(TokenType::LeftParen) {
+            let arg_count = self.arguments();
+            self.compiler.emit_bytes(OpCode::OpInvoke.into(), constant_idx);
+            self.compiler.emit_byte(arg_count);
         } else {
             self.compiler.emit_bytes(OpCode::OpGetProperty.into(), constant_idx);
         }
@@ -2375,6 +2428,13 @@ fn disassemble_instruction(strings: &Interner, functions: &Vec<Function>, chunk:
         return offset + 3;
     }
 
+    fn invoke_instruction(name: &str, chunk: &Chunk, offset: usize) -> usize {
+        let constant = chunk.code[offset + 1];
+        let arg_count = chunk.code[offset + 2];
+        println!("{name:<16} ({arg_count} args) {constant:>4}");
+        return offset + 3;
+    }
+
     print!("{:0>4} ", offset);
     if offset > 0 && chunk.lines.get(offset).unwrap() == chunk.lines.get(offset - 1).unwrap() {
         print!("   | ");
@@ -2441,7 +2501,7 @@ fn disassemble_instruction(strings: &Interner, functions: &Vec<Function>, chunk:
         OpCode::OpGetProperty => constant_instruction("OP_GET_PROPERTY", chunk, offset),
         OpCode::OpSetProperty => constant_instruction("OP_SET_PROPERTY", chunk, offset),
         OpCode::OpMethod => constant_instruction("OP_METHOD", chunk, offset),
-        OpCode::OpInvoke => 0,
+        OpCode::OpInvoke => invoke_instruction("OP_INVOKE", chunk, offset),
     };
 }
 
